@@ -181,3 +181,4 @@ unsigned char *delta_create(const unsigned char *base, size_t blen,
                             const unsigned char *tgt, size_t tlen, size_t *dlen);
 unsigned char *delta_apply(const unsigned char *base, size_t blen,
                            const unsigned char *d, size_t dlen, size_t *olen);
+uint64_t get_varint_pub(const unsigned char **p, const unsigned char *end, int *bad);

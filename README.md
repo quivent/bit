@@ -1,6 +1,6 @@
 # bit
 
-git's data model, reimplemented in 3,206 lines of C.
+git's data model, reimplemented in 3,484 lines of C.
 
 bit writes **byte-identical objects to git**. A repository bit creates is one
 git reads: `git fsck` returns 0, `git log` reads bit's commits, and `git status`
@@ -87,7 +87,7 @@ timing is reported. Method and the full table in [BENCHMARK.md](BENCHMARK.md).
 | `cat-file -e`, miss | 1.79 ms | 18.76 ms | 10.46× |
 | `clone`, 100 files | 9.03 ms | 10.66 ms | 1.18× |
 | `fetch`, nothing new | 1.86 ms | 26.16 ms | 14.10× |
-| pack index | **12.0 B/object** | 32.5 B/object | 2.70× |
+| pack directory | **0.46 B/object** | 32.4 B/object | 73× |
 
 **How to read these.** The 5–6× on small operations is largely git's start-up:
 git loads a 4 MB binary that parses configuration and discovers a repository
@@ -116,21 +116,45 @@ whether to write, so every blob was decompressed and discarded. Deciding from
 `stat` costs a syscall; deciding from content costs a read, an inflate and a
 SHA-1.
 
-### The pack index
+### There is no index
 
-git's `.idx` spends 31.5 B/object; bit spends 12.0.
+An index records where an arbitrary write order happened to put things, and it
+exists only because the order was arbitrary. Here the digest is the address: an
+object's leading bits choose a bucket, objects are written grouped by bucket,
+and a lookup computes the bucket and walks it. What is stored is one offset per
+bucket — about one per eight objects — instead of a digest and an offset per
+object.
 
-| part | git | bit | why |
+| | git `.idx` | bit, before | bit |
 |---|---|---|---|
-| fanout table | 1,024 B | 0 | 300 sorted entries is eight probes |
-| digest | 20 B/obj | 8 B/obj | a prefix is a filter, not an identifier |
-| CRC32 | 4 B/obj | 0 | the digest already proves the content |
-| offset | 4 B/obj | 4 B/obj | unchanged |
+| per object | 32.4 B | 12.0 B | **0.46 B** |
+| 600 objects | 15,640 B | 7,212 B | **276 B** |
 
-Truncating costs **no safety**: a hit is confirmed by rehashing against all 160
-bits, and a prefix index has no false negatives, so absence is exact and free.
-Only a positive check pays a decompression — measured at 13.86 µs for a miss
-against 39.40 µs for a hit.
+Walking a bucket has to tell entries apart without reconstructing each one, so
+an entry carries a single fingerprint byte, taken from the far end of the digest
+so it is independent of the bits that chose the bucket. A fingerprint match is
+still only a filter; the object is rehashed against all 160 bits before it is
+returned. That is the same discipline the old truncated index used, with the
+filter no longer stored.
+
+Measured on a 600-object history, against the twelve-byte index entry that used
+to point at each object:
+
+| kind | count | B each | the index entry that pointed at it |
+|---|---|---|---|
+| blob | 123 | 8.4 | **142%** |
+| delta | 120 | 58.9 | 20% |
+| tree | 356 | 43.6 | 28% |
+| commit | 1 | 132.0 | 9% |
+
+For blobs the pointer outweighed the object.
+
+One thing was given up. Placement by digest is incompatible with placement by
+similarity, which is what delta base-finding wants, so bases are chosen in
+similarity order and the objects are then placed in digest order — a base may
+now sit either side of the entry referencing it. The links are acyclic by
+construction, but the reader's guarantee of termination is the depth cap rather
+than a monotonic offset.
 
 ### Delta encoding
 
@@ -195,11 +219,11 @@ pull    11 reachable, 0 new
 
 | gain | cost |
 |---|---|
-| `bit pack`: a 4.7× denser representation, 12.0 B/object index | git cannot read the objects while packed. Reversible — `bit unpack` restores loose form, every object verified against its digest before being written |
+| `bit pack`: a 4.7× denser representation, a 0.46 B/object directory | git cannot read the objects while packed. Reversible — `bit unpack` restores loose form, every object verified against its digest before being written |
 | delta encoding: 2.3× smaller pack on real content | packing is 3.3× slower than `git gc --aggressive`, and a read may now apply a chain of up to 50 deltas |
-| 8-byte digest prefix | a *positive* existence check pays one decompression |
+| no stored digest at all | an existence check walks a bucket of ~8 entries and pays one reconstruction per fingerprint match |
 | no CRC32 | objects cannot be copied between packs without inflating |
-| no fanout table | eight probes rather than ~4 |
+| no fanout table, no index | the bucket is computed, then walked |
 | stat cache | requires the racy-index guard, or it is wrong, not merely fast |
 | `push` is fast-forward only | cannot force-push; refuses rather than discarding remote commits |
 | `pull` fast-forwards or stops | does not begin a merge the caller did not ask for |

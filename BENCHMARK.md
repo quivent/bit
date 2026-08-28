@@ -157,6 +157,33 @@ insert and lookup walk end to end. Switching to chaining took the same pack from
 16.8 s to 3.1 s. A rolling hash added just before that, on the theory that the
 scan was the cost, was worth 0.8 s of the 16.8.
 
+## The index, deleted
+
+The pack index was 12.0 B/object: an eight-byte digest prefix and a four-byte
+offset. Measured against the objects it pointed at, on a 600-object history:
+
+| kind | count | B each | index entry, as a share of it |
+|---|---|---|---|
+| blob | 123 | 8.4 | **142%** |
+| delta | 120 | 58.9 | 20% |
+| tree | 356 | 43.6 | 28% |
+| commit | 1 | 132.0 | 9% |
+
+For the most numerous small object the pointer was larger than the object. The
+index existed only because the write order was arbitrary; objects are now
+written grouped by a bucket taken from the digest's leading bits, so the
+location is computed rather than recorded. What is stored is one offset per
+bucket, about one bucket per eight objects.
+
+| | before | after |
+|---|---|---|
+| 600 objects | pack 22,969 B + index 7,212 B | pack 23,763 B + directory 276 B |
+| total | 30,181 B | **24,039 B** |
+
+The pack grew by 794 B -- one fingerprint byte per object, which is what lets a
+bucket be walked without reconstructing every entry in it, plus fixed-width base
+offsets in delta entries. The directory shrank by 6,936 B.
+
 ## Caveats
 
 - The working-tree arms use random-content blobs, which is why packing is

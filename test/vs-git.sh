@@ -152,7 +152,7 @@ LOOSE=$(perl -e '$s=0;for(`find .git -type f`){chomp;$s+=int(((-s $_)+4095)/4096
 NOBJ=$(find .git/objects -type f | wc -l | tr -d ' ')
 "$B/pack" > "$T/packout"
 BPACK=$(perl -e '$s=0;for(`find .git/bitpack -type f`){chomp;$s+=-s $_}print $s')
-BIDX=$(wc -c < .git/bitpack/bit.idx | tr -d ' ')
+BIDX=$(wc -c < .git/bitpack/bit.dir | tr -d ' ')
 git gc -q 2>/dev/null || true
 GPACK=$(perl -e '$s=0;for(`find .git/objects/pack -name "*.pack"`){chomp;$s+=-s $_}print $s')
 GIDX=$(perl -e '$s=0;for(`find .git/objects/pack -name "*.idx"`){chomp;$s+=-s $_}print $s')
@@ -161,7 +161,7 @@ my ($n,$bp,$bi,$gp,$gi) = @ARGV;
 printf("  %-30s %8s    %8s\n","", "bit", "git");
 printf("  %-30s %8d B  %8d B\n","pack body",$bp-$bi,$gp);
 printf("  %-30s %8d B  %8d B   %.2fx\n","index",$bi,$gi,$gi/$bi);
-printf("  %-30s %8.1f    %8.1f    %.2fx\n","index B/object",$bi/$n,$gi/$n,($gi/$n)/($bi/$n));
+printf("  %-30s %8.1f    %8.1f    %.2fx\n","directory B/object",$bi/$n,$gi/$n,($gi/$n)/($bi/$n));
 ' "$NOBJ" "$BPACK" "$BIDX" "$GPACK" "$GIDX"
 echo
 echo "  objects: $NOBJ    loose on disk: $LOOSE B"

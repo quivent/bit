@@ -24,37 +24,63 @@ logical bytes barely moved. Almost the entire win was problem 1.
 
 ```
 .git/bitpack/bit.pack
-  "BITPACK1"                    8
+  "BITPACK3"                    8
   u32 count                     4
-  per object, at a recorded offset, one of two entry shapes:
+  objects, grouped by bucket, buckets ascending:
+    u8      type | flags  1     1 commit, 2 tree, 3 blob, 7 delta
+                                | 0x08: payload is stored, not deflated
+    u8      fingerprint   1     digest byte 19
+    u32     base offset   4     delta entries only
+    varint  inflated length
+    varint  payload length
+    bytes   raw deflate, or the bytes themselves if 0x08
 
-    whole object
-      u8      type              1     1 commit, 2 tree, 3 blob
-      varint  inflated length
-      varint  compressed length
-      bytes   zlib data
-
-    delta against an earlier object
-      u8      type              1     7
-      varint  base offset             absolute, always < this entry's offset
-      varint  inflated delta length
-      varint  compressed length
-      bytes   zlib delta
-
-  A delta entry has no type of its own; it inherits the type of the object at
-  the end of its base chain. Bases always precede the entries that reference
-  them, so resolution walks backwards through the file and terminates.
-
-.git/bitpack/bit.idx
-  "BITIDX01"                    8
+.git/bitpack/bit.dir
+  "BITDIR01"                    8
   u32 count                     4
-  per object, sorted by prefix:
-    u8[8]   digest prefix       8
-    u32     offset into pack    4
+  u32 buckets                   4     a power of two
+  u8  bucket bits               1
+  u8  offset width              1
+  (buckets + 1) offsets               where each bucket starts
 ```
 
-Not `.git/objects/pack/`. git parses anything it finds there and reports
-`non-monotonic index`.
+Raw deflate, not zlib. A zlib stream adds a two-byte header and a four-byte
+adler32 -- six bytes per object to detect corruption the object's own digest
+already detects, and detect it worse. Where the median object is a fifty-byte
+tree that was 13% of the pack. An object deflate cannot shrink is stored as it
+is, flagged in the type byte.
+
+A delta entry has no type of its own; it inherits the type of the object at the
+end of its base chain.
+
+## There is no index
+
+An index records where an arbitrary write order happened to put things. The
+order here is not arbitrary: an object's leading bits are its bucket, and the
+pack is written in bucket order, so a reader computes the location instead of
+looking it up. Stored per bucket rather than per object:
+
+| | git `.idx` | prefix index | bucket directory |
+|---|---|---|---|
+| per object | 32.4 B | 12.0 B | **0.46 B** |
+
+Bucket count is one per eight objects, rounded to a power of two, so the
+directory is roughly `4 * n / 8` bytes and a walk visits about eight entries.
+Both the bucket count and the offset width are recorded in the header; a reader
+assumes neither.
+
+The fingerprint byte is what makes the walk cheap: without it, telling entries
+apart would mean reconstructing each one. It is taken from the far end of the
+digest so it carries no information the bucket bits already carry. It is a
+filter and nothing more -- the candidate is rehashed against all 160 bits
+before it is returned, which is the same rule the truncated prefix index
+followed, with the prefix no longer stored.
+
+Placement by digest cannot also be placement by similarity, and similarity is
+what delta base-finding needs. Bases are therefore chosen in (type, size) order
+and the objects are then placed in digest order, so a base may sit either side
+of the entry that references it. The links are acyclic by construction; the
+reader's guarantee of termination is the depth cap, not a monotonic offset.
 
 ## The delta stream
 
@@ -116,7 +142,7 @@ those collapse into a single cluster that both insert and lookup traverse end
 to end, which is quadratic. Chaining, with a cap of 64 chain entries examined
 per position, took packing the 32 MB corpus from 16.8 s to 3.1 s.
 
-## The index, against git's
+## Against git's index
 
 git's `.idx` spends **31.5 B/object**; ours spends **12.0**.
 

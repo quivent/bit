@@ -483,34 +483,48 @@ static int build_tree(const bit_index *ix, const char *prefix, oid *out) {
 
 int tree_from_index(const bit_index *ix, oid *out) { return build_tree(ix, "", out); }
 
+int entry_matches_stat(const bit_entry *e, const char *full) {
+    struct stat st;
+    if (stat(full, &st) < 0) return 0;
+    if (e->size  != (uint32_t)st.st_size)  return 0;
+    if (e->mtime != (uint32_t)st.st_mtime) return 0;
+    if (e->ino   != (uint32_t)st.st_ino)   return 0;
+    /* Racily clean: the entry was stamped in the same second the index was
+       written, so a later same-second, same-length rewrite would look identical.
+       Refuse the shortcut and let the caller hash. */
+    if (index_mtime && e->mtime >= index_mtime) return 0;
+    return 1;
+}
+
+int tree_walk(const oid *tree, const char *prefix, tree_cb cb, void *ctx) {
+    char type[32]; size_t len;
+    unsigned char *d = object_read(tree, type, sizeof type, &len);
+    if (!d || strcmp(type, "tree")) { free(d); return -1; }
+
+    int rc = 0;
+    unsigned char *p = d, *end = d + len;
+    while (p < end && !rc) {
+        char *sp = strchr((char *)p, ' ');
+        if (!sp) break;
+        uint32_t mode = (uint32_t)strtoul((char *)p, 0, 8);
+        char *name = sp + 1;
+        char *nul = name + strlen(name);
+        oid id; memcpy(id.b, nul + 1, OID_RAW);
+
+        char path[1024];
+        snprintf(path, sizeof path, "%s%s%s", prefix, *prefix ? "/" : "", name);
+        rc = (mode & 040000) ? tree_walk(&id, path, cb, ctx) : cb(path, mode, &id, ctx);
+        p = (unsigned char *)nul + 1 + OID_RAW;
+    }
+    free(d);
+    return rc;
+}
+
 /* ---- pack ---- */
 
-#define PACK_MAGIC "BITPACK1"
-#define IDX_MAGIC  "BITIDX01"
-#define IDX_PREFIX 8                       /* bytes of digest kept in the index */
-#define IDX_SLOT   (IDX_PREFIX + 4)
-
-static void pack_paths_in(const char *git, char *pack, size_t pc, char *idx, size_t ic) {
-    // Not .git/objects/pack: this is not git's pack format, and git tries to
-    // parse anything it finds there, reporting "non-monotonic index".
-    char dir[1200]; snprintf(dir, sizeof dir, "%s/bitpack", git);
-    mkdir(dir, 0755);
-    snprintf(pack, pc, "%s/bit.pack", dir);
-    snprintf(idx,  ic, "%s/bit.idx",  dir);
-}
-
-static void pack_paths(char *pack, size_t pc, char *idx, size_t ic) {
-    char git[1024];
-    if (repo_git_dir(git, sizeof git) < 0) die("not a bit repository");
-    pack_paths_in(git, pack, pc, idx, ic);
-}
-
-static void put_varint(FILE *f, uint64_t v) {
-    do { unsigned char b = v & 0x7f; v >>= 7; if (v) b |= 0x80; fputc(b, f); } while (v);
-}
-/* Bounded, for the same reason dvarint_get is: a pack is a file, and a file
-   can be truncated or wrong. On a truncated or over-long encoding this parks
-   *p at `end` and sets *bad, which every caller checks before using the value. */
+/* Bounded: a pack is a file, and a file can be truncated or wrong. On a
+   truncated or over-long encoding this parks *p at `end` and sets *bad, which
+   every caller checks before using the value. */
 static uint64_t get_varint(const unsigned char **p, const unsigned char *end, int *bad) {
     uint64_t v = 0; int shift = 0;
     for (;;) {
@@ -522,6 +536,9 @@ static uint64_t get_varint(const unsigned char **p, const unsigned char *end, in
     }
     return v;
 }
+uint64_t get_varint_pub(const unsigned char **p, const unsigned char *end, int *bad) {
+    return get_varint(p, end, bad);
+}
 static int type_code(const char *t) {
     return !strcmp(t,"commit") ? 1 : !strcmp(t,"tree") ? 2 : 3;
 }
@@ -529,32 +546,137 @@ static const char *type_name(int c) {
     return c == 1 ? "commit" : c == 2 ? "tree" : "blob";
 }
 
-typedef struct { oid id; uint32_t off; } idx_ent;
-static int idx_cmp(const void *a, const void *b) {
-    return memcmp(((const idx_ent *)a)->id.b, ((const idx_ent *)b)->id.b, IDX_PREFIX);
-}
-
-/* --- pack, with delta ---
- *
- * Objects are written in (type, size-descending) order, which puts objects
- * likely to resemble each other next to each other. Each one is then offered
- * the last DELTA_WIN objects of its own type as a base: if the smallest delta
- * compresses to less than the object itself does, the delta is what gets
- * stored, along with the absolute pack offset of its base.
- *
- * A base is always written before anything that deltas against it, so
- * resolution walks backwards through the file and terminates. Chains are
- * capped at DELTA_DEPTH so a read is never more than that many applies. */
-
 #ifndef DELTA_WIN
 #define DELTA_WIN   32
 #endif
 #ifndef DELTA_DEPTH
 #define DELTA_DEPTH 50
 #endif
+
+#define PACK_MAGIC "BITPACK3"
+#define DIR_MAGIC  "BITDIR01"
+
+/* --- where an object lives ---
+ *
+ * There is no index. An index is a record of where an arbitrary write order
+ * happened to put things, and it only exists because the order was arbitrary.
+ * Here the digest is the address: an object's leading bits choose its bucket,
+ * objects are written grouped by bucket, and a lookup computes the bucket and
+ * walks it. What is stored is one offset per bucket -- about one bucket per
+ * eight objects -- rather than one digest and one offset per object.
+ *
+ * Walking a bucket needs to tell entries apart without reconstructing each
+ * one, so an entry carries a single fingerprint byte, taken from the far end
+ * of the digest so it is independent of the bits that chose the bucket. A
+ * fingerprint match is still only a filter; the object is rehashed against all
+ * 160 bits before it is returned, exactly as the digest prefix used to be.
+ *
+ *                     per object          600 objects
+ *   digest + offset   12 B (was)          7,212 B
+ *   bucket directory   0.4 B              304 B
+ *   fingerprint        1 B                600 B  (inside the pack)
+ */
+#define BUCKET_LOAD 8                      /* objects per bucket, on average */
+#define TC_STORED   0x08
 #define TC_DELTA    7
 
-typedef struct { int tc; unsigned char *data; size_t len; uint32_t off; int depth; } win_t;
+static uint32_t oid_bucket(const oid *o, int bits) {
+    if (bits <= 0) return 0;
+    uint32_t v = ((uint32_t)o->b[0] << 24) | ((uint32_t)o->b[1] << 16)
+               | ((uint32_t)o->b[2] << 8)  |  (uint32_t)o->b[3];
+    return v >> (32 - bits);
+}
+static int bucket_bits_for(size_t n) {
+    int bits = 0;
+    while (((size_t)1 << bits) * BUCKET_LOAD < n && bits < 24) bits++;
+    return bits;
+}
+#define FP_BYTE 19                         /* last digest byte; not a bucket bit */
+
+/* Raw deflate, not zlib. A zlib stream wraps the deflate data in a two-byte
+   header and a four-byte adler32 -- six bytes per object whose only job is to
+   detect corruption that the object's own digest already detects, and detect
+   it worse. On a history-shaped repository, where the median object is a
+   fifty-byte tree, those six bytes were 13% of the entire pack. */
+static int raw_deflate(const unsigned char *in, size_t ilen,
+                       unsigned char *out, size_t *olen) {
+    z_stream z; memset(&z, 0, sizeof z);
+    if (deflateInit2(&z, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                     Z_DEFAULT_STRATEGY) != Z_OK) return -1;
+    z.next_in = (Bytef *)in;   z.avail_in  = (uInt)ilen;
+    z.next_out = out;          z.avail_out = (uInt)*olen;
+    int r = deflate(&z, Z_FINISH);
+    *olen = z.total_out;
+    deflateEnd(&z);
+    return r == Z_STREAM_END ? 0 : -1;
+}
+static int raw_inflate(const unsigned char *in, size_t ilen,
+                       unsigned char *out, size_t olen) {
+    z_stream z; memset(&z, 0, sizeof z);
+    if (inflateInit2(&z, -15) != Z_OK) return -1;
+    z.next_in = (Bytef *)in;   z.avail_in  = (uInt)ilen;
+    z.next_out = out;          z.avail_out = (uInt)olen;
+    int r = inflate(&z, Z_FINISH);
+    int ok = (r == Z_STREAM_END && z.total_out == olen);
+    inflateEnd(&z);
+    return ok ? 0 : -1;
+}
+
+static void pack_paths_in(const char *git, char *pack, size_t pc, char *idx, size_t ic) {
+    // Not .git/objects/pack: this is not git's pack format, and git tries to
+    // parse anything it finds there, reporting "non-monotonic index".
+    char dir[1200]; snprintf(dir, sizeof dir, "%s/bitpack", git);
+    mkdir(dir, 0755);
+    snprintf(pack, pc, "%s/bit.pack", dir);
+    snprintf(idx,  ic, "%s/bit.dir",  dir);
+}
+static void pack_paths(char *pack, size_t pc, char *idx, size_t ic) {
+    char git[1024];
+    if (repo_git_dir(git, sizeof git) < 0) die("not a bit repository");
+    pack_paths_in(git, pack, pc, idx, ic);
+}
+
+/* The bucket directory, parsed. Nothing reads its bytes directly: the offset
+   width and the bucket count are chosen per repository and recorded. */
+typedef struct { const unsigned char *b; uint32_t n, nb; int bits, ow; } dirview;
+
+#define DIR_HDR 18                         /* magic 8, count 4, buckets 4, bits 1, ow 1 */
+
+static int dir_open(const unsigned char *d, size_t dlen, dirview *v) {
+    if (!d || dlen < DIR_HDR || memcmp(d, DIR_MAGIC, 8)) return -1;
+    memcpy(&v->n,  d + 8,  4);
+    memcpy(&v->nb, d + 12, 4);
+    v->bits = d[16]; v->ow = d[17];
+    if (v->ow < 1 || v->ow > 8 || v->bits > 24) return -1;
+    if (v->nb != (uint32_t)1 << v->bits) return -1;
+    if (dlen < DIR_HDR + ((size_t)v->nb + 1) * (size_t)v->ow) return -1;
+    v->b = d + DIR_HDR;
+    return 0;
+}
+static size_t dir_at(const dirview *v, uint32_t i) {
+    const unsigned char *p = v->b + (size_t)i * v->ow;
+    size_t o = 0;
+    for (int k = v->ow - 1; k >= 0; k--) o = (o << 8) | p[k];
+    return o;
+}
+
+static int offw_for(size_t sz) { int w = 1; while (w < 8 && sz > ((size_t)1 << (8 * w))) w++; return w; }
+
+static void put_off(FILE *f, size_t v, int w) {
+    unsigned char b[8];
+    for (int k = 0; k < w; k++) b[k] = (unsigned char)(v >> (8 * k));
+    fwrite(b, 1, (size_t)w, f);
+}
+
+static void dvarint_w(unsigned char **p, uint64_t v) {
+    do { unsigned char c = v & 0x7f; v >>= 7; if (v) c |= 0x80; *(*p)++ = c; } while (v);
+}
+static size_t varint_len(uint64_t v) { size_t n = 0; do { n++; v >>= 7; } while (v); return n; }
+
+/* A candidate delta base, held while the representation of each object is
+   being decided. `rec` is a position in the record array, not a file offset:
+   at this point nothing has been placed. */
+typedef struct { int tc; unsigned char *data; size_t len; long rec; int depth; } win_t;
 
 typedef struct { oid id; int tc; size_t size; } meta_t;
 static int meta_cmp(const void *a, const void *b) {
@@ -564,31 +686,63 @@ static int meta_cmp(const void *a, const void *b) {
     return memcmp(x->id.b, y->id.b, OID_RAW);
 }
 
-/* varint into a buffer rather than a FILE, for measuring an entry before
-   committing to it */
-static size_t buf_varint(unsigned char *p, uint64_t v) {
-    size_t n = 0;
-    do { unsigned char b = v & 0x7f; v >>= 7; if (v) b |= 0x80; p[n++] = b; } while (v);
-    return n;
+/* One object, after its representation has been decided but before it has been
+   placed. `base` is an index into this same array, not a file offset, because
+   nothing has an offset yet. */
+typedef struct {
+    oid id; int tc; int is_delta; int stored;
+    long base;                       /* index into recs, or -1 */
+    size_t ulen;                     /* inflated length of the payload */
+    unsigned char *pay; size_t paylen;
+    size_t off;                      /* filled in when written */
+    size_t basefield;                /* file offset of the 4-byte base field */
+    int depth;
+} rec_t;
+
+static int rec_by_digest(const void *a, const void *b) {
+    return memcmp(((const rec_t *)a)->id.b, ((const rec_t *)b)->id.b, OID_RAW);
 }
 
-/* Defined below; pack_write needs it to read the pack it is about to replace. */
-static unsigned char *pack_at(const unsigned char *pk, size_t plen, uint32_t off,
+static unsigned char *pack_at(const unsigned char *pk, size_t plen, size_t off,
                               int *tc_out, size_t *len_out, int depth);
+
+/* Parse one entry header. Returns the offset just past it, or 0 on a malformed
+   entry. Every field the walk needs comes from here, so a bucket can be scanned
+   without reconstructing anything. */
+static size_t entry_head(const unsigned char *pk, size_t plen, size_t off,
+                         int *tc, int *stored, unsigned char *fp,
+                         size_t *basefield, uint64_t *ulen, uint64_t *zlen) {
+    if (off + 2 > plen) return 0;
+    const unsigned char *pend = pk + plen, *p = pk + off;
+    int raw = *p++;
+    *stored = raw & TC_STORED;
+    *tc = raw & ~TC_STORED;
+    *fp = *p++;
+    if (*tc == TC_DELTA) {
+        if ((size_t)(p - pk) + 4 > plen) return 0;
+        if (basefield) *basefield = (size_t)(p - pk);
+        p += 4;
+    } else if (*tc < 1 || *tc > 3) return 0;
+    int bad = 0;
+    *ulen = get_varint(&p, pend, &bad);
+    *zlen = get_varint(&p, pend, &bad);
+    if (bad || *ulen > (uint64_t)1 << 34) return 0;
+    if ((size_t)(p - pk) + *zlen > plen) return 0;
+    return (size_t)(p - pk);
+}
 
 int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
     char git[1024]; if (repo_git_dir(git, sizeof git) < 0) return -1;
     char objdir[1200]; snprintf(objdir, sizeof objdir, "%s/objects", git);
-    char packp[1300], idxp[1300];
-    pack_paths(packp, sizeof packp, idxp, sizeof idxp);
+    char packp[1300], dirp[1300];
+    pack_paths(packp, sizeof packp, dirp, sizeof dirp);
 
-    /* Pass 1: everything that must end up in the new pack. That is the loose
-       store *and* whatever the current pack already holds -- packing is how a
-       repository reclaims disk, so by the second pack the loose copies of the
-       first pack's objects are usually gone. Enumerating only the loose store
-       wrote a pack containing the new objects alone and overwrote the one
-       holding the history, which read afterwards as a repository that had
-       silently lost its older commits. */
+    /* Pass 1: everything that must end up in the new pack -- the loose store
+       and whatever the current pack already holds. Packing is how a repository
+       reclaims disk, so by the second pack the loose copies of the first
+       pack's objects are usually gone; enumerating only the loose store wrote
+       a pack containing the new objects alone and renamed it over the one
+       holding the history. */
     meta_t *m = 0; size_t n = 0, cap = 0;
     oidset seen; oidset_init(&seen);
     #define ADD_META(O, TC, SZ) do { \
@@ -624,213 +778,273 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
 
     size_t oplen = 0; unsigned char *oldpk = (unsigned char *)slurp(packp, &oplen);
     if (oldpk && oplen >= 12 && !memcmp(oldpk, PACK_MAGIC, 8)) {
-        size_t ilen; unsigned char *ix = (unsigned char *)slurp(idxp, &ilen);
-        if (ix && ilen >= 12 && !memcmp(ix, IDX_MAGIC, 8)) {
-            uint32_t pn; memcpy(&pn, ix + 8, 4);
-            for (uint32_t i = 0; i < pn && 12 + (size_t)(i + 1) * IDX_SLOT <= ilen; i++) {
-                uint32_t off; memcpy(&off, ix + 12 + i * IDX_SLOT + IDX_PREFIX, 4);
-                int tc; size_t ulen;
-                unsigned char *data = pack_at(oldpk, oplen, off, &tc, &ulen, 0);
-                if (!data) continue;
-                oid o; object_write(type_name(tc), data, ulen, 0, &o);
-                free(data);
-                if (memcmp(o.b, ix + 12 + i * IDX_SLOT, IDX_PREFIX)) continue;  /* corrupt */
-                ADD_META(o, tc, ulen);
+        size_t dlen; unsigned char *od = (unsigned char *)slurp(dirp, &dlen);
+        dirview v;
+        if (od && dir_open(od, dlen, &v) == 0) {
+            size_t off = 12, endall = dir_at(&v, v.nb);
+            while (off < endall && off < oplen) {
+                int tc, st; unsigned char fp; uint64_t ul, zl;
+                size_t body = entry_head(oldpk, oplen, off, &tc, &st, &fp, 0, &ul, &zl);
+                if (!body) break;
+                int rtc; size_t rlen;
+                unsigned char *data = pack_at(oldpk, oplen, off, &rtc, &rlen, 0);
+                if (data) {
+                    oid o; object_write(type_name(rtc), data, rlen, 0, &o);
+                    free(data);
+                    if (o.b[FP_BYTE] == fp) ADD_META(o, rtc, rlen);   /* else corrupt */
+                }
+                off = body + zl;
             }
         }
-        free(ix);
+        free(od);
     }
     free(oldpk);
     oidset_free(&seen);
     #undef ADD_META
 
+    /* Pass 2: decide each object's representation, in similarity order, so
+       that objects likely to resemble each other are offered to each other as
+       delta bases. Nothing is placed yet -- a base is recorded as a position
+       in this array, not as a file offset. */
     qsort(m, n, sizeof *m, meta_cmp);
-
-    /* Pass 2: write beside the live pack, then rename. Reads during this pass
-       still resolve through the old pack for anything no longer loose, and a
-       failure or a crash leaves the repository exactly as it was. */
-    char tpackp[1400], tidxp[1400];
-    snprintf(tpackp, sizeof tpackp, "%s.tmp", packp);
-    snprintf(tidxp,  sizeof tidxp,  "%s.tmp", idxp);
-
-    idx_ent *ents = xmalloc((n ? n : 1) * sizeof *ents);
-    FILE *pf = fopen(tpackp, "wb");
-    if (!pf) { free(m); free(ents); return -1; }
-    fwrite(PACK_MAGIC, 1, 8, pf);
-    uint32_t zero = 0; fwrite(&zero, 4, 1, pf);
+    rec_t *recs = xmalloc((n ? n : 1) * sizeof *recs);
+    long *where = xmalloc((n ? n : 1) * sizeof *where);   /* meta index -> rec index */
+    size_t nr = 0;
 
     win_t win[DELTA_WIN]; int nwin = 0, wnext = 0;
     memset(win, 0, sizeof win);
 
-    size_t w = 0;                       /* objects actually written */
-    int overflow = 0;
     for (size_t i = 0; i < n; i++) {
+        where[i] = -1;
         char type[32]; size_t len;
         unsigned char *data = object_read(&m[i].id, type, sizeof type, &len);
-        if (!data) continue;            /* not counted: see w, not i, below */
+        if (!data) continue;
         int tc = type_code(type);
 
-        long here = ftell(pf);
-        if (here < 0 || here > 0xFFFFFFFFL) { overflow = 1; free(data); break; }
-
-        uLongf zfull = compressBound((uLong)len);
+        size_t zfull = compressBound((uLong)len) + 64;
         unsigned char *zf = xmalloc(zfull);
-        compress2(zf, &zfull, data, (uLong)len, Z_DEFAULT_COMPRESSION);
+        int fstored = 0;
+        if (raw_deflate(data, len, zf, &zfull) != 0 || zfull >= len) {
+            memcpy(zf, data, len); zfull = len; fstored = 1;
+        }
 
-        /* smallest delta the window can offer */
         unsigned char *bestz = 0; size_t bestzlen = 0, bestraw = 0;
-        uint32_t bestoff = 0; int bestdepth = 0;
+        long bestbase = -1; int bestdepth = 0, beststored = 0;
         for (int wi = 0; wi < nwin; wi++) {
             if (win[wi].tc != tc || win[wi].depth >= DELTA_DEPTH) continue;
             size_t dl;
             unsigned char *dd = delta_create(win[wi].data, win[wi].len, data, len, &dl);
             if (!dd) continue;
-            uLongf zd = compressBound((uLong)dl);
+            size_t zd = compressBound((uLong)dl) + 64;
             unsigned char *zz = xmalloc(zd);
-            compress2(zz, &zd, dd, (uLong)dl, Z_DEFAULT_COMPRESSION);
+            int dstored = 0;
+            if (raw_deflate(dd, dl, zz, &zd) != 0 || zd >= dl) {
+                memcpy(zz, dd, dl); zd = dl; dstored = 1;
+            }
             free(dd);
             if (!bestz || zd < bestzlen) {
                 free(bestz);
                 bestz = zz; bestzlen = zd; bestraw = dl;
-                bestoff = win[wi].off; bestdepth = win[wi].depth + 1;
+                bestbase = win[wi].rec; bestdepth = win[wi].depth + 1;
+                beststored = dstored;
             } else free(zz);
         }
 
-        uint32_t off = (uint32_t)here;
-        int stored_delta = 0;
+        int use_delta = 0;
         if (bestz) {
-            /* compare whole entries, header included -- a delta entry carries a
-               base offset the full entry does not */
-            unsigned char hd[32];
-            size_t doverhead = 1 + buf_varint(hd, bestoff) + buf_varint(hd, bestraw)
-                                 + buf_varint(hd, bestzlen);
-            size_t foverhead = 1 + buf_varint(hd, len) + buf_varint(hd, zfull);
-            if (doverhead + bestzlen < foverhead + zfull) stored_delta = 1;
+            /* whole entries, headers included: a delta carries a 4-byte base */
+            size_t dtot = 2 + 4 + varint_len(bestraw) + varint_len(bestzlen) + bestzlen;
+            size_t ftot = 2 + varint_len(len) + varint_len(zfull) + zfull;
+            if (dtot < ftot) use_delta = 1;
         }
 
-        if (stored_delta) {
-            fputc(TC_DELTA, pf);
-            put_varint(pf, bestoff);
-            put_varint(pf, bestraw);
-            put_varint(pf, bestzlen);
-            fwrite(bestz, 1, bestzlen, pf);
+        rec_t *r = &recs[nr];
+        r->id = m[i].id; r->tc = tc; r->base = -1; r->basefield = 0;
+        if (use_delta) {
+            r->is_delta = 1; r->stored = beststored; r->base = bestbase;
+            r->ulen = bestraw; r->pay = bestz; r->paylen = bestzlen;
+            r->depth = bestdepth;
+            free(zf);
         } else {
-            fputc(tc, pf);
-            put_varint(pf, len);
-            put_varint(pf, zfull);
-            fwrite(zf, 1, zfull, pf);
-            bestdepth = 0;
+            r->is_delta = 0; r->stored = fstored;
+            r->ulen = len; r->pay = zf; r->paylen = zfull;
+            r->depth = 0;
+            free(bestz);
         }
-        free(bestz); free(zf);
+        where[i] = (long)nr;
+        nr++;
 
-        ents[w].id = m[i].id;
-        ents[w].off = off;
-        w++;
-
-        /* into the window; the slot it displaces is freed */
         free(win[wnext].data);
         win[wnext].tc = tc; win[wnext].data = data; win[wnext].len = len;
-        win[wnext].off = off; win[wnext].depth = bestdepth;
+        win[wnext].rec = (long)(nr - 1); win[wnext].depth = r->depth;
         wnext = (wnext + 1) % DELTA_WIN;
         if (nwin < DELTA_WIN) nwin++;
     }
     for (int wi = 0; wi < nwin; wi++) free(win[wi].data);
-    free(m);
+    free(m); free(where);
 
-    if (overflow || ferror(pf)) {       /* offsets are u32; refuse rather than wrap */
-        fclose(pf); unlink(tpackp); free(ents);
-        return -1;
+    /* Pass 3: place. Sorting by digest puts every object in its bucket and the
+       buckets in order, which is the whole point: the reader recomputes this
+       from the digest instead of looking it up.
+       Base links survive the reordering because they are array positions, not
+       offsets. A base may now sit *after* the entry that references it, so the
+       reader's guarantee of termination is the depth cap rather than a
+       monotonic offset -- the links themselves are acyclic by construction,
+       each having been chosen from an object decided earlier. */
+    long *newpos = xmalloc((nr ? nr : 1) * sizeof *newpos);
+    for (size_t i = 0; i < nr; i++) recs[i].off = i;      /* remember old position */
+    rec_t *sorted = xmalloc((nr ? nr : 1) * sizeof *sorted);
+    memcpy(sorted, recs, nr * sizeof *recs);
+    qsort(sorted, nr, sizeof *sorted, rec_by_digest);
+    for (size_t i = 0; i < nr; i++) newpos[sorted[i].off] = (long)i;
+    for (size_t i = 0; i < nr; i++)
+        if (sorted[i].base >= 0) sorted[i].base = newpos[sorted[i].base];
+    free(recs); free(newpos);
+    recs = sorted;
+
+    int bits = bucket_bits_for(nr);
+    uint32_t nb = (uint32_t)1 << bits;
+
+    char tpackp[1400], tdirp[1400];
+    snprintf(tpackp, sizeof tpackp, "%s.tmp", packp);
+    snprintf(tdirp,  sizeof tdirp,  "%s.tmp", dirp);
+
+    FILE *pf = fopen(tpackp, "wb");
+    if (!pf) { for (size_t i = 0; i < nr; i++) free(recs[i].pay); free(recs); return -1; }
+    fwrite(PACK_MAGIC, 1, 8, pf);
+    uint32_t cnt = (uint32_t)nr; fwrite(&cnt, 4, 1, pf);
+
+    size_t *bstart = xmalloc(((size_t)nb + 1) * sizeof *bstart);
+    for (uint32_t b = 0; b <= nb; b++) bstart[b] = 0;
+    uint32_t curb = 0;
+    int overflow = 0;
+    for (size_t i = 0; i < nr; i++) {
+        long here = ftell(pf);
+        if (here < 0 || here > 0xFFFFFFFFL) { overflow = 1; break; }
+        recs[i].off = (size_t)here;
+        uint32_t b = oid_bucket(&recs[i].id, bits);
+        while (curb <= b) bstart[curb++] = (size_t)here;     /* empty buckets too */
+
+        fputc((recs[i].is_delta ? TC_DELTA : recs[i].tc)
+              | (recs[i].stored ? TC_STORED : 0), pf);
+        fputc(recs[i].id.b[FP_BYTE], pf);
+        if (recs[i].is_delta) {
+            recs[i].basefield = (size_t)ftell(pf);
+            unsigned char z4[4] = {0,0,0,0}; fwrite(z4, 1, 4, pf);   /* patched below */
+        }
+        unsigned char vb[24], *vp = vb;
+        dvarint_w(&vp, recs[i].ulen);
+        dvarint_w(&vp, recs[i].paylen);
+        fwrite(vb, 1, (size_t)(vp - vb), pf);
+        fwrite(recs[i].pay, 1, recs[i].paylen, pf);
     }
-    n = w;                              /* the header counts what was written */
-    fseek(pf, 8, SEEK_SET); uint32_t cnt = (uint32_t)n; fwrite(&cnt, 4, 1, pf);
-    fseek(pf, 0, SEEK_END); size_t psize = (size_t)ftell(pf);
-    if (fclose(pf) != 0) { unlink(tpackp); free(ents); return -1; }
+    size_t endall = (size_t)ftell(pf);
+    while (curb <= nb) bstart[curb++] = endall;
 
-    qsort(ents, n, sizeof *ents, idx_cmp);
-    FILE *xf = fopen(tidxp, "wb");
-    if (!xf) { unlink(tpackp); free(ents); return -1; }
-    fwrite(IDX_MAGIC, 1, 8, xf);
+    /* Pass 4: patch each delta's base offset, now that every object has one. */
+    if (!overflow) {
+        for (size_t i = 0; i < nr; i++) {
+            if (!recs[i].is_delta) continue;
+            uint32_t bo = (uint32_t)recs[recs[i].base].off;
+            fseek(pf, (long)recs[i].basefield, SEEK_SET);
+            unsigned char b4[4];
+            for (int k = 0; k < 4; k++) b4[k] = (unsigned char)(bo >> (8 * k));
+            fwrite(b4, 1, 4, pf);
+        }
+    }
+    for (size_t i = 0; i < nr; i++) free(recs[i].pay);
+    free(recs);
+
+    if (overflow || ferror(pf)) { fclose(pf); unlink(tpackp); free(bstart); return -1; }
+    fseek(pf, 0, SEEK_END);
+    size_t psize = (size_t)ftell(pf);
+    if (fclose(pf) != 0) { unlink(tpackp); free(bstart); return -1; }
+
+    int ow = offw_for(psize);
+    FILE *xf = fopen(tdirp, "wb");
+    if (!xf) { unlink(tpackp); free(bstart); return -1; }
+    fwrite(DIR_MAGIC, 1, 8, xf);
     fwrite(&cnt, 4, 1, xf);
-    for (size_t i = 0; i < n; i++) {
-        fwrite(ents[i].id.b, 1, IDX_PREFIX, xf);
-        fwrite(&ents[i].off, 4, 1, xf);
-    }
-    size_t isize = (size_t)ftell(xf);
+    fwrite(&nb, 4, 1, xf);
+    fputc(bits, xf); fputc(ow, xf);
+    for (uint32_t b = 0; b <= nb; b++) put_off(xf, bstart[b], ow);
+    size_t dsize = (size_t)ftell(xf);
     int xerr = ferror(xf); if (fclose(xf) != 0) xerr = 1;
-    free(ents);
-    if (xerr) { unlink(tpackp); unlink(tidxp); return -1; }
+    free(bstart);
+    if (xerr) { unlink(tpackp); unlink(tdirp); return -1; }
 
-    if (rename(tpackp, packp) != 0) { unlink(tpackp); unlink(tidxp); return -1; }
-    if (rename(tidxp, idxp) != 0) return -1;
+    if (rename(tpackp, packp) != 0) { unlink(tpackp); unlink(tdirp); return -1; }
+    if (rename(tdirp, dirp) != 0) return -1;
 
-    if (n_out) *n_out = (int)n;
+    if (n_out) *n_out = (int)nr;
     if (pack_out) *pack_out = psize;
-    if (idx_out) *idx_out = isize;
+    if (idx_out) *idx_out = dsize;
     return 0;
 }
 
 int pack_stats(int *nobj, int *ndelta_out) {
-    char packp[1300], idxp[1300];
-    pack_paths(packp, sizeof packp, idxp, sizeof idxp);
+    char packp[1300], dirp[1300];
+    pack_paths(packp, sizeof packp, dirp, sizeof dirp);
     size_t plen; unsigned char *pk = (unsigned char *)slurp(packp, &plen);
-    if (!pk) return -1;
-    if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) { free(pk); return -1; }
-    uint32_t n; memcpy(&n, pk + 8, 4);
-    const unsigned char *pend = pk + plen;
-    size_t off = 12; int nd = 0;
-    for (uint32_t i = 0; i < n && off < plen; i++) {
-        const unsigned char *p = pk + off;
-        int bad = 0;
-        int tc = *p++;
-        if (tc == TC_DELTA) { get_varint(&p, pend, &bad); nd++; }
-        get_varint(&p, pend, &bad);
-        uint64_t zlen = get_varint(&p, pend, &bad);
-        if (bad) break;
-        off = (size_t)(p - pk) + zlen;
+    size_t dlen; unsigned char *dd = (unsigned char *)slurp(dirp, &dlen);
+    dirview v;
+    if (!pk || dir_open(dd, dlen, &v) < 0) { free(pk); free(dd); return -1; }
+    size_t off = 12, endall = dir_at(&v, v.nb);
+    int nd = 0;
+    while (off < endall && off < plen) {
+        int tc, st; unsigned char fp; uint64_t ul, zl;
+        size_t body = entry_head(pk, plen, off, &tc, &st, &fp, 0, &ul, &zl);
+        if (!body) break;
+        if (tc == TC_DELTA) nd++;
+        off = body + zl;
     }
-    free(pk);
-    if (nobj) *nobj = (int)n;
+    if (nobj) *nobj = (int)v.n;
     if (ndelta_out) *ndelta_out = nd;
+    free(pk); free(dd);
     return 0;
 }
 
 /* Reconstruct the object at `off`, following the base chain if it is a delta.
-   `depth` guards against a corrupt file pointing a chain at itself. */
-static unsigned char *pack_at(const unsigned char *pk, size_t plen, uint32_t off,
+   Placement is by digest, so a base may sit either side of the entry that
+   references it; the links are acyclic by construction and `depth` is what
+   makes a corrupt file terminate. */
+static unsigned char *pack_at(const unsigned char *pk, size_t plen, size_t off,
                               int *tc_out, size_t *len_out, int depth) {
-    if (depth > DELTA_DEPTH + 2 || off + 1 >= plen) return 0;
-    const unsigned char *pend = pk + plen, *p = pk + off;
-    int bad = 0;
-    int tc = *p++;
+    if (depth > DELTA_DEPTH + 2) return 0;
+    int tc, stored; unsigned char fp; uint64_t ulen, zlen; size_t bf = 0;
+    size_t body = entry_head(pk, plen, off, &tc, &stored, &fp, &bf, &ulen, &zlen);
+    if (!body) return 0;
+    const unsigned char *p = pk + body;
 
     if (tc != TC_DELTA) {
-        if (tc < 1 || tc > 3) return 0;        /* type_name maps anything to "blob" */
-        uint64_t ulen = get_varint(&p, pend, &bad), zlen = get_varint(&p, pend, &bad);
-        if (bad || ulen > (uint64_t)1 << 34) return 0;
-        if ((size_t)(p - pk) + zlen > plen) return 0;
         unsigned char *out = xmalloc(ulen + 1);
-        uLongf got = (uLongf)ulen;
-        if (uncompress(out, &got, p, (uLong)zlen) != Z_OK || got != ulen) { free(out); return 0; }
+        if (stored) {
+            if (zlen != ulen) { free(out); return 0; }
+            memcpy(out, p, (size_t)ulen);
+        } else if (raw_inflate(p, (size_t)zlen, out, (size_t)ulen) != 0) {
+            free(out); return 0;
+        }
         out[ulen] = 0;
         if (tc_out) *tc_out = tc;
         if (len_out) *len_out = (size_t)ulen;
         return out;
     }
 
-    uint64_t boff = get_varint(&p, pend, &bad), dlen = get_varint(&p, pend, &bad),
-             zlen = get_varint(&p, pend, &bad);
-    if (bad || dlen > (uint64_t)1 << 34) return 0;
-    if ((size_t)(p - pk) + zlen > plen || boff >= off) return 0;   /* bases precede */
-    unsigned char *dz = xmalloc(dlen + 1);
-    uLongf got = (uLongf)dlen;
-    if (uncompress(dz, &got, p, (uLong)zlen) != Z_OK || got != dlen) { free(dz); return 0; }
+    uint32_t boff = 0;
+    for (int k = 3; k >= 0; k--) boff = (boff << 8) | pk[bf + k];
+    if (boff == off || boff >= plen) return 0;
+    unsigned char *dz = xmalloc(ulen + 1);
+    if (stored) {
+        if (zlen != ulen) { free(dz); return 0; }
+        memcpy(dz, p, (size_t)ulen);
+    } else if (raw_inflate(p, (size_t)zlen, dz, (size_t)ulen) != 0) { free(dz); return 0; }
 
     int btc; size_t blen;
-    unsigned char *base = pack_at(pk, plen, (uint32_t)boff, &btc, &blen, depth + 1);
+    unsigned char *base = pack_at(pk, plen, boff, &btc, &blen, depth + 1);
     if (!base) { free(dz); return 0; }
 
     size_t olen;
-    unsigned char *out = delta_apply(base, blen, dz, (size_t)dlen, &olen);
+    unsigned char *out = delta_apply(base, blen, dz, (size_t)ulen, &olen);
     free(base); free(dz);
     if (!out) return 0;
     if (tc_out) *tc_out = btc;                 /* a delta inherits its base's type */
@@ -838,145 +1052,94 @@ static unsigned char *pack_at(const unsigned char *pk, size_t plen, uint32_t off
     return out;
 }
 
-/* The same lookup, against an arbitrary repository's pack. Transport reads
-   objects out of a repository that is not this one, and until this existed the
-   whole cross-repository layer saw only loose files: cloning a packed source
-   produced an empty clone, and pushing to a packed destination re-sent every
-   object it already had. */
+/* The lookup. The digest names the bucket; the bucket is walked. No stored
+   digest, no stored per-object offset -- the fingerprint byte in each entry is
+   what makes the walk cheap, and the rehash at the end is what makes it
+   correct. */
 void *pack_read_in(const char *gitdir, const oid *o, char *type_out,
                    size_t type_cap, size_t *len_out) {
-    char packp[1400], idxp[1400];
-    pack_paths_in(gitdir, packp, sizeof packp, idxp, sizeof idxp);
-    size_t ilen; unsigned char *ix = (unsigned char *)slurp(idxp, &ilen);
-    if (!ix) return 0;
-    if (ilen < 12 || memcmp(ix, IDX_MAGIC, 8)) { free(ix); return 0; }
-    uint32_t n; memcpy(&n, ix + 8, 4);
-
-    /* binary search on the 8-byte prefix; no fanout table */
-    long lo = 0, hi = (long)n - 1; long hit = -1;
-    while (lo <= hi) {
-        long mid = (lo + hi) / 2;
-        int c = memcmp(ix + 12 + mid * IDX_SLOT, o->b, IDX_PREFIX);
-        if (c == 0) { hit = mid; break; }
-        if (c < 0) lo = mid + 1; else hi = mid - 1;
-    }
-    if (hit < 0) { free(ix); return 0; }
-    /* Entries sharing a prefix are adjacent, because the index is sorted on it.
-       Rewind to the first, then try each until one rehashes to the full oid. */
-    while (hit > 0 && memcmp(ix + 12 + (hit - 1) * IDX_SLOT, o->b, IDX_PREFIX) == 0) hit--;
-    /* Grown rather than capped. Balls-in-bins puts the real maximum run at 1-2
-       for any plausible object count, but a fixed array here would drop a
-       candidate silently, and the dropped one could be the object asked for. */
-    uint32_t *cand = 0; int ncand = 0, ccap = 0;
-    for (long j = hit; j < (long)n; j++) {
-        if (memcmp(ix + 12 + j * IDX_SLOT, o->b, IDX_PREFIX) != 0) break;
-        if (ncand == ccap) { ccap = ccap ? ccap * 2 : 8;
-                             cand = xrealloc(cand, (size_t)ccap * sizeof *cand); }
-        memcpy(&cand[ncand++], ix + 12 + j * IDX_SLOT + IDX_PREFIX, 4);
-    }
-    free(ix);
+    char packp[1400], dirp[1400];
+    pack_paths_in(gitdir, packp, sizeof packp, dirp, sizeof dirp);
+    size_t dlen; unsigned char *dd = (unsigned char *)slurp(dirp, &dlen);
+    dirview v;
+    if (dir_open(dd, dlen, &v) < 0) { free(dd); return 0; }
+    uint32_t b = oid_bucket(o, v.bits);
+    size_t off = dir_at(&v, b), stop = dir_at(&v, b + 1);
+    free(dd);
+    if (stop <= off) return 0;
 
     size_t plen; unsigned char *pk = (unsigned char *)slurp(packp, &plen);
-    if (!pk) { free(cand); return 0; }
-    for (int k = 0; k < ncand; k++) {
-        int tc; size_t ulen;
-        unsigned char *out = pack_at(pk, plen, cand[k], &tc, &ulen, 0);
-        if (!out) continue;
-        /* the prefix was a filter; the rehash decides */
-        oid check; object_write(type_name(tc), out, ulen, 0, &check);
-        if (!oid_eq(&check, o)) { free(out); continue; }
-        free(pk); free(cand);
-        if (type_out) snprintf(type_out, type_cap, "%s", type_name(tc));
-        if (len_out) *len_out = ulen;
-        return out;
+    if (!pk) return 0;
+    if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) { free(pk); return 0; }
+    if (stop > plen) stop = plen;
+
+    while (off < stop) {
+        int tc, st; unsigned char fp; uint64_t ul, zl;
+        size_t body = entry_head(pk, plen, off, &tc, &st, &fp, 0, &ul, &zl);
+        if (!body) break;
+        if (fp == o->b[FP_BYTE]) {                 /* a filter, not an answer */
+            int rtc; size_t rlen;
+            unsigned char *out = pack_at(pk, plen, off, &rtc, &rlen, 0);
+            if (out) {
+                oid check; object_write(type_name(rtc), out, rlen, 0, &check);
+                if (oid_eq(&check, o)) {
+                    free(pk);
+                    if (type_out) snprintf(type_out, type_cap, "%s", type_name(rtc));
+                    if (len_out) *len_out = rlen;
+                    return out;
+                }
+                free(out);
+            }
+        }
+        off = body + zl;
     }
-    free(pk); free(cand);
+    free(pk);
     return 0;
 }
 
-/* ---- tree walking ---- */
-
-int tree_walk(const oid *tree, const char *prefix, tree_cb cb, void *ctx) {
-    char type[32]; size_t len;
-    unsigned char *d = object_read(tree, type, sizeof type, &len);
-    if (!d || strcmp(type, "tree")) { free(d); return -1; }
-
-    int rc = 0;
-    unsigned char *p = d, *end = d + len;
-    while (p < end && !rc) {
-        char *sp = strchr((char *)p, ' ');
-        if (!sp) break;
-        uint32_t mode = (uint32_t)strtoul((char *)p, 0, 8);
-        char *name = sp + 1;
-        char *nul = name + strlen(name);
-        oid id; memcpy(id.b, nul + 1, OID_RAW);
-
-        char path[1024];
-        snprintf(path, sizeof path, "%s%s%s", prefix, *prefix ? "/" : "", name);
-        rc = (mode & 040000) ? tree_walk(&id, path, cb, ctx) : cb(path, mode, &id, ctx);
-        p = (unsigned char *)nul + 1 + OID_RAW;
-    }
-    free(d);
-    return rc;
-}
-
-int entry_matches_stat(const bit_entry *e, const char *full) {
-    struct stat st;
-    if (stat(full, &st) < 0) return 0;
-    if (e->size  != (uint32_t)st.st_size)  return 0;
-    if (e->mtime != (uint32_t)st.st_mtime) return 0;
-    if (e->ino   != (uint32_t)st.st_ino)   return 0;
-    /* Racily clean: the entry was stamped in the same second the index was
-       written, so a later same-second, same-length rewrite would look identical.
-       Refuse the shortcut and let the caller hash. */
-    if (index_mtime && e->mtime >= index_mtime) return 0;
-    return 1;
-}
-
-/* Restore every packed object to loose form. Packing is a mode, not a
- * one-way door: while packed the store is dense and git cannot read it;
- * unpacked it is larger and git can. Round-tripping is lossless because an
- * object's identity is its content, so what comes out hashes to what went in. */
 int pack_unpack(int *n_out) {
-    char packp[1300], idxp[1300];
-    pack_paths(packp, sizeof packp, idxp, sizeof idxp);
+    char packp[1300], dirp[1300];
+    pack_paths(packp, sizeof packp, dirp, sizeof dirp);
     size_t plen; unsigned char *pk = (unsigned char *)slurp(packp, &plen);
     if (!pk) return -1;
-    if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) { free(pk); return -1; }
-    size_t ilen; unsigned char *ix = (unsigned char *)slurp(idxp, &ilen);
-    if (!ix || ilen < 12 || memcmp(ix, IDX_MAGIC, 8)) { free(pk); free(ix); return -1; }
-    uint32_t n; memcpy(&n, ix + 8, 4);
+    if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) {
+        if (plen >= 8 && !memcmp(pk, "BITPACK", 7))
+            fprintf(stderr, "bit: this pack is an earlier format (%.8s); this "
+                            "build writes %s.\n", pk, PACK_MAGIC);
+        free(pk); return -1;
+    }
+    size_t dlen; unsigned char *dd = (unsigned char *)slurp(dirp, &dlen);
+    dirview v;
+    if (dir_open(dd, dlen, &v) < 0) { free(pk); free(dd); return -1; }
 
-    /* Driven from the index, and every object checked against the digest
-       prefix recorded there before it is written.
-       Unpacking is the one path that turns pack bytes into repository state,
-       and it used to trust them completely: a single flipped type byte made a
-       tree land as a blob under a different name, the real tree vanish, and
-       the command still report success. Reads never had this problem because
-       pack_read rehashes; this is that same check, moved to the one place it
-       was missing. */
+    /* Every object is checked against the fingerprint recorded with it before
+       it is written. Unpacking is the one path that turns pack bytes into
+       repository state, and it used to trust them completely: a single flipped
+       type byte made a tree land as a blob under a different name, the real
+       tree vanish, and the command still report success. */
     int done = 0, bad = 0;
-    for (uint32_t i = 0; i < n && 12 + (size_t)(i + 1) * IDX_SLOT <= ilen; i++) {
-        const unsigned char *slot = ix + 12 + (size_t)i * IDX_SLOT;
-        uint32_t off; memcpy(&off, slot + IDX_PREFIX, 4);
-
-        int tc; size_t ulen;
-        unsigned char *out = pack_at(pk, plen, off, &tc, &ulen, 0);
-        if (!out) { bad++; continue; }
-
+    size_t off = 12, endall = dir_at(&v, v.nb);
+    if (endall > plen) endall = plen;
+    while (off < endall) {
+        int tc, st; unsigned char fp; uint64_t ul, zl;
+        size_t body = entry_head(pk, plen, off, &tc, &st, &fp, 0, &ul, &zl);
+        if (!body) { bad++; break; }
+        int rtc; size_t rlen;
+        unsigned char *out = pack_at(pk, plen, off, &rtc, &rlen, 0);
+        if (!out) { bad++; off = body + zl; continue; }
         oid o;
-        object_write(type_name(tc), out, ulen, 0, &o);        /* hash, do not write */
-        if (memcmp(o.b, slot, IDX_PREFIX)) { free(out); bad++; continue; }
-
-        object_write(type_name(tc), out, ulen, 1, &o);        /* now write it loose */
+        object_write(type_name(rtc), out, rlen, 0, &o);        /* hash, do not write */
+        if (o.b[FP_BYTE] != fp) { free(out); bad++; off = body + zl; continue; }
+        object_write(type_name(rtc), out, rlen, 1, &o);        /* now write it loose */
         free(out);
         done++;
+        off = body + zl;
     }
-    free(pk); free(ix);
+    free(pk); free(dd);
     if (n_out) *n_out = done;
     if (bad) {
-        fprintf(stderr, "bit: %d of %u objects in the pack are corrupt and were "
-                        "not written; the repository is incomplete\n", bad, n);
+        fprintf(stderr, "bit: %d objects in the pack are corrupt and were not "
+                        "written; the repository is incomplete\n", bad);
         return -1;
     }
     return 0;
@@ -989,22 +1152,7 @@ void *pack_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out) 
 }
 
 int pack_exists_in(const char *gitdir, const oid *o) {
-    char packp[1400], idxp[1400];
-    pack_paths_in(gitdir, packp, sizeof packp, idxp, sizeof idxp);
-    size_t ilen; unsigned char *ix = (unsigned char *)slurp(idxp, &ilen);
-    if (!ix) return 0;
-    if (ilen < 12 || memcmp(ix, IDX_MAGIC, 8)) { free(ix); return 0; }
-    uint32_t n; memcpy(&n, ix + 8, 4);
-    long lo = 0, hi = (long)n - 1, hit = -1;
-    while (lo <= hi) {
-        long mid = (lo + hi) / 2;
-        int c = memcmp(ix + 12 + mid * IDX_SLOT, o->b, IDX_PREFIX);
-        if (c == 0) { hit = mid; break; }
-        if (c < 0) lo = mid + 1; else hi = mid - 1;
-    }
-    free(ix);
-    if (hit < 0) return 0;                    /* exact: no false negatives */
-    void *d = pack_read_in(gitdir, o, 0, 0, 0);   /* only a hit pays the inflate */
+    void *d = pack_read_in(gitdir, o, 0, 0, 0);
     if (!d) return 0;
     free(d);
     return 1;
