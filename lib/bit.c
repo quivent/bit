@@ -494,6 +494,21 @@ static int build_tree(const bit_index *ix, const char *prefix, oid *out) {
 
 int tree_from_index(const bit_index *ix, oid *out) { return build_tree(ix, "", out); }
 
+/* The stat fields alone, with no judgement about raciness. */
+int entry_stat_equal(const bit_entry *e, const char *full) {
+    struct stat st;
+    if (stat(full, &st) < 0) return 0;
+    if (e->size  != (uint32_t)st.st_size)  return 0;
+    if (e->mtime != (uint32_t)st.st_mtime) return 0;
+    if (e->ino   != (uint32_t)st.st_ino)   return 0;
+    return 1;
+}
+/* Stamped in the same second the index was written, so a same-second rewrite
+   of the same length would look identical. The caller must read the file. */
+int entry_is_racy(const bit_entry *e) {
+    return index_mtime && e->mtime >= index_mtime;
+}
+
 int entry_matches_stat(const bit_entry *e, const char *full) {
     struct stat st;
     if (stat(full, &st) < 0) return 0;
@@ -1475,9 +1490,29 @@ static int co_put(const char *path, uint32_t mode, const oid *id, void *v) {
 
     /* Already correct? Decide from the old index and a stat. Never read, and
        above all never inflate before knowing whether the write is needed. */
+    /* Already correct? Decide from the old index and a stat, and never inflate
+       before knowing whether the write is needed.
+       A file whose stat fields match but which was stamped in the same second
+       the index was written cannot be judged by stat alone -- mtime has
+       one-second granularity, so a same-second rewrite of the same length is
+       indistinguishable. Rewriting it unconditionally was not merely wasteful
+       but self-perpetuating: the rewrite stamped a fresh mtime in the same
+       second as the next index write, so the same files were rewritten on
+       every checkout, for ever. Reading the file and comparing its digest
+       settles it, and costs less than the pack lookup and write it avoids. */
     const bit_entry *old = c->old ? ix_find(c->old, path) : 0;
-    if (old && oid_eq(&old->id, id) && entry_matches_stat(old, full)
-            && stat(full, &st) == 0) {
+    int ok = old && oid_eq(&old->id, id) && entry_stat_equal(old, full)
+             && stat(full, &st) == 0;
+    if (ok && entry_is_racy(old)) {
+        size_t wl; char *wd = worktree_read(full, &wl, 0);
+        ok = 0;
+        if (wd) {
+            oid now; object_write("blob", wd, wl, 0, &now);
+            free(wd);
+            ok = oid_eq(&now, id);
+        }
+    }
+    if (ok) {
         bit_entry e; stamp(&e, path, id, mode, &st);
         index_upsert(c->ix, &e);
         c->n++;

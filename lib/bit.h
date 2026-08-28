@@ -121,6 +121,8 @@ int tree_walk(const oid *tree, const char *prefix, tree_cb cb, void *ctx);
  * which is the whole reason the index carries mtime/size/ino: an unchanged
  * file is decided without reading, let alone hashing, its contents. */
 int entry_matches_stat(const bit_entry *e, const char *full);
+int entry_stat_equal(const bit_entry *e, const char *full);
+int entry_is_racy(const bit_entry *e);
 int pack_unpack(int *n_out);   /* pack -> loose objects, restoring git readability */
 /* Existence, without inflating unless it has to.
  * Returns 0 = definitively absent, 1 = present (confirmed by rehash).
