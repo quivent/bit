@@ -322,10 +322,16 @@ static int tree_name_cmp(const char *a, int a_dir, const char *b, int b_dir) {
 /* Build the tree for `prefix` (empty for the root) from index entries. */
 static int build_tree(const bit_index *ix, const char *prefix, oid *out) {
     size_t plen = strlen(prefix);
-    struct { char name[512]; int is_dir; oid id; uint32_t mode; } kids[4096];
-    size_t nk = 0;
+    /* On the heap, and grown as needed. This array was 4,096 fixed entries of
+       ~540 bytes -- a 2.1 MB stack frame per recursion level, which overflowed
+       an 8 MB stack at three levels of nesting. The test suite never caught it
+       because every fixture nested only two. */
+    typedef struct { char name[512]; int is_dir; oid id; uint32_t mode; } kid_t;
+    size_t nk = 0, kcap = 64;
+    kid_t *kids = malloc(kcap * sizeof *kids);
+    if (!kids) return -1;
 
-    for (size_t i = 0; i < ix->n && nk < 4096; i++) {
+    for (size_t i = 0; i < ix->n; i++) {
         const char *path = ix->e[i].path;
         if (plen && (strncmp(path, prefix, plen) || path[plen] != '/')) continue;
         const char *rest = plen ? path + plen + 1 : path;
@@ -338,12 +344,18 @@ static int build_tree(const bit_index *ix, const char *prefix, oid *out) {
         for (; j < nk; j++) if (!strcmp(kids[j].name, name)) break;
         if (j < nk) continue;                              /* directory already seen */
 
+        if (nk == kcap) {
+            kcap *= 2;
+            kid_t *grown = realloc(kids, kcap * sizeof *kids);
+            if (!grown) { free(kids); return -1; }
+            kids = grown;
+        }
         snprintf(kids[nk].name, sizeof kids[nk].name, "%s", name);
         kids[nk].is_dir = slash != 0;
         if (slash) {
             char sub[1024];
             snprintf(sub, sizeof sub, "%s%s%s", prefix, plen ? "/" : "", name);
-            if (build_tree(ix, sub, &kids[nk].id) < 0) return -1;
+            if (build_tree(ix, sub, &kids[nk].id) < 0) { free(kids); return -1; }
             kids[nk].mode = 040000;
         } else {
             kids[nk].id = ix->e[i].id;
@@ -368,6 +380,7 @@ static int build_tree(const bit_index *ix, const char *prefix, oid *out) {
     }
     int rc = object_write("tree", buf, len, 1, out);
     free(buf);
+    free(kids);
     return rc;
 }
 

@@ -49,7 +49,17 @@ git fsck >/dev/null 2>&1 && ok "git fsck exits 0" || bad "git fsck" "nonzero" "0
 t=$("$B/cat-file" -t "$(git rev-parse HEAD)")
 [ "$t" = "commit" ] && ok "bit cat-file -t on its own commit" || bad "cat-file -t" "$t" "commit"
 
-# 6. bit's own log agrees with git's
+# 6. deep nesting. A regression test: build_tree once held a 2.1 MB array on the
+# stack per recursion level and overflowed at three levels. Every fixture here
+# nested only two, so nothing caught it.
+deep=d; n=1
+while [ $n -lt 60 ]; do deep="$deep/l$n"; n=$((n+1)); done
+mkdir -p "$deep" && printf 'bottom\n' > "$deep/f.txt"
+"$B/add" d >/dev/null
+cmp2 "write-tree at 60 levels" "$("$B/write-tree")" "$(git write-tree)"
+
+# 7. bit's own log agrees with git's
+
 cmp2 "bit log == git log" "$("$B/log" --oneline)" "$(git log --oneline)"
 
 [ $fail = 0 ] && printf "\n  parity: ALL PASS\n" || printf "\n  parity: FAILURES\n"

@@ -168,6 +168,46 @@ pull    11 reachable, 0 new
 - **Benchmark variance** reaches ~0.3 ms on millisecond arms. Only rows gathered
   in one batch may be compared, which is why `vs-git.sh` gathers all of them.
 
+### Hard limits
+
+These are fixed sizes in the source. None is reached by ordinary use; all of
+them truncate silently rather than failing loudly, which is the wrong behaviour
+and is not yet fixed.
+
+| limit | value | consequence |
+|---|---|---|
+| `merge_base` ancestry | 4,096 commits per side | a base further back is not found |
+| `reachable_in` queue | 4,096 commits | a longer history truncates during transfer |
+| `pack_read` candidates | 8 sharing a digest prefix | balls-in-bins puts the real maximum at 1–2 |
+| `clone`/`fetch`/`push` | 200,000 objects | larger transfers truncate |
+
+`merge_base` also scans its visited list linearly, so it is O(n²) in ancestry
+depth.
+
+## Audit
+
+The implementation was audited with escalating compiler strictness, sanitizers,
+hostile input, and pathological content.
+
+| check | result |
+|---|---|
+| `-Wall -Wextra -Wpedantic -std=c11` | 0 warnings |
+| AddressSanitizer + UBSan, full flow | clean, with every command verified to have run |
+| hostile input, all 26 commands | every one reports and exits non-zero; no crashes |
+| binary files, empty files, no trailing newline | `write-tree` matches git exactly |
+| no-trailing-newline diff | matches git, including the `\ No newline` marker |
+| directory nesting to 100 levels | matches git exactly |
+
+**One real defect was found and fixed.** `build_tree` held a 4,096-entry array
+of ~540-byte structs on the stack — a 2.1 MB frame *per recursion level* — which
+overflowed an 8 MB stack at three levels of directory nesting. git handled the
+same tree. Every fixture in the test suite nested exactly two levels, so nothing
+caught it. The array is now heap-allocated and grows, and `parity.sh` asserts a
+60-level tree.
+
+Known and unfixed: 31 of 32 allocations are unchecked for `NULL`, and the hard
+limits above truncate silently.
+
 ## Reproducing
 
 ```sh
