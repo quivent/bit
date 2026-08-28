@@ -576,7 +576,24 @@ static const char *type_name(int c) {
  *   bucket directory   0.4 B              304 B
  *   fingerprint        1 B                600 B  (inside the pack)
  */
-#define BUCKET_LOAD 8                      /* objects per bucket, on average */
+#ifndef BUCKET_LOAD
+/* Objects per bucket. The directory costs one offset per bucket and a walk
+   parses one entry header per object in it, so this trades directory bytes
+   against walk time -- and the trade is very lopsided. Measured on 5,052
+   objects:
+ *
+ *      load    directory   walk      total addressing cost
+ *         8      0.61 B     31 ns    1.61 B/object
+ *        64      0.08 B    209 ns    1.08 B/object
+ *       256      0.02 B  1,570 ns    1.02 B/object
+ *
+ * The +1 B in every total is the fingerprint byte each entry carries, which is
+ * what makes a walk cheap, and past load 64 it is the whole cost -- the
+ * directory has stopped mattering while the walk keeps growing. 209 ns is also
+ * invisible next to the ~470 us a lookup currently spends reading the pack
+ * file, so the walk is free at this end and the directory is not. */
+#define BUCKET_LOAD 64
+#endif
 #define TC_STORED   0x08
 #define TC_DELTA    7
 

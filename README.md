@@ -87,7 +87,7 @@ timing is reported. Method and the full table in [BENCHMARK.md](BENCHMARK.md).
 | `cat-file -e`, miss | 1.79 ms | 18.76 ms | 10.46× |
 | `clone`, 100 files | 9.03 ms | 10.66 ms | 1.18× |
 | `fetch`, nothing new | 1.86 ms | 26.16 ms | 14.10× |
-| pack directory | **0.46 B/object** | 32.4 B/object | 73× |
+| addressing | **1.08 B/object** | 28.05 B/object | 26× |
 
 **How to read these.** The 5–6× on small operations is largely git's start-up:
 git loads a 4 MB binary that parses configuration and discovers a repository
@@ -122,39 +122,51 @@ An index records where an arbitrary write order happened to put things, and it
 exists only because the order was arbitrary. Here the digest is the address: an
 object's leading bits choose a bucket, objects are written grouped by bucket,
 and a lookup computes the bucket and walks it. What is stored is one offset per
-bucket — about one per eight objects — instead of a digest and an offset per
-object.
+bucket, plus one fingerprint byte inside each entry so the walk can tell entries
+apart without reconstructing them.
 
-| | git `.idx` | bit, before | bit |
+Both halves count. The honest figure is the total:
+
+| | git `.idx` | bit |
+|---|---|---|
+| per object, stored | 28.05 B | **1.08 B** |
+| | | 0.08 B directory + 1 B fingerprint |
+
+**26×**, and it is the *addressing*, not the objects — bit's pack body is 1.06×
+smaller than git's, no more. Measured at four repository sizes, the directory
+holds at a fraction of a byte per object while git's index stays near 28:
+
+| objects | bit directory | B/obj | git `.idx` | B/obj |
+|---|---|---|---|---|
+| 152 | 27 B | 0.18 | 5,328 B | 35.05 |
+| 1,052 | 63 B | 0.06 | 30,528 B | 29.02 |
+| 5,052 | 405 B | 0.08 | 142,528 B | 28.21 |
+| 20,052 | 1,557 B | 0.08 | 562,528 B | 28.05 |
+
+Bucket size is the one tuning knob, and it is lopsided. Measured on 5,052
+objects:
+
+| objects per bucket | directory | walk | total per object |
 |---|---|---|---|
-| per object | 32.4 B | 12.0 B | **0.46 B** |
-| 600 objects | 15,640 B | 7,212 B | **276 B** |
+| 8 | 0.61 B | 31 ns | 1.61 B |
+| 64 | 0.08 B | 209 ns | **1.08 B** |
+| 256 | 0.02 B | 1,570 ns | 1.02 B |
 
-Walking a bucket has to tell entries apart without reconstructing each one, so
-an entry carries a single fingerprint byte, taken from the far end of the digest
-so it is independent of the bits that chose the bucket. A fingerprint match is
-still only a filter; the object is rehashed against all 160 bits before it is
-returned. That is the same discipline the old truncated index used, with the
-filter no longer stored.
+Past 64 the directory has stopped mattering — the fingerprint byte is the whole
+remaining cost — while the walk keeps growing. 209 ns is also invisible beside
+the ~470 µs a lookup currently spends reading the pack file, which is the real
+thing to fix next.
 
-Measured on a 600-object history, against the twelve-byte index entry that used
-to point at each object:
+A fingerprint match is only a filter; the candidate is rehashed against all 160
+bits before it is returned. That is the rule the truncated prefix index already
+followed, with the prefix no longer stored.
 
-| kind | count | B each | the index entry that pointed at it |
-|---|---|---|---|
-| blob | 123 | 8.4 | **142%** |
-| delta | 120 | 58.9 | 20% |
-| tree | 356 | 43.6 | 28% |
-| commit | 1 | 132.0 | 9% |
-
-For blobs the pointer outweighed the object.
-
-One thing was given up. Placement by digest is incompatible with placement by
+One thing was given up. Placement by digest cannot also be placement by
 similarity, which is what delta base-finding wants, so bases are chosen in
-similarity order and the objects are then placed in digest order — a base may
-now sit either side of the entry referencing it. The links are acyclic by
-construction, but the reader's guarantee of termination is the depth cap rather
-than a monotonic offset.
+similarity order and objects are then placed in digest order — a base may sit
+either side of the entry referencing it. The links are acyclic by construction,
+but the reader's guarantee of termination is the depth cap rather than a
+monotonic offset.
 
 ### Delta encoding
 
@@ -219,7 +231,7 @@ pull    11 reachable, 0 new
 
 | gain | cost |
 |---|---|
-| `bit pack`: a 4.7× denser representation, a 0.46 B/object directory | git cannot read the objects while packed. Reversible — `bit unpack` restores loose form, every object verified against its digest before being written |
+| `bit pack`: a 4.7× denser representation, 1.08 B/object of addressing | git cannot read the objects while packed. Reversible — `bit unpack` restores loose form, every object verified against its digest before being written |
 | delta encoding: 2.3× smaller pack on real content | packing is 3.3× slower than `git gc --aggressive`, and a read may now apply a chain of up to 50 deltas |
 | no stored digest at all | an existence check walks a bucket of ~8 entries and pays one reconstruction per fingerprint match |
 | no CRC32 | objects cannot be copied between packs without inflating |
