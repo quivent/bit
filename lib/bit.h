@@ -105,6 +105,11 @@ char *slurp(const char *path, size_t *len);
 int  pack_write(int *n_out, size_t *pack_out, size_t *idx_out);
 void *pack_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out);
 int  pack_stats(int *nobj, int *ndelta);
+/* The same two, against a repository other than this one. Transport needs them:
+   a packed repository is still a repository. */
+void *pack_read_in(const char *gitdir, const oid *o, char *type_out,
+                   size_t type_cap, size_t *len_out);
+int  pack_exists_in(const char *gitdir, const oid *o);
 
 /* --- trees ---
  * Walk a tree recursively. cb receives the path relative to the tree root, the

@@ -41,6 +41,11 @@ Formats are git's exactly:
 - **commits** — text, with 40-character hex digests
 - **index** — git's binary v2 format, which is why `git status` reads what `bit add` staged
 
+`bit pack` writes the denser representation; it does **not** remove the loose
+objects it packed, so running it alone increases disk use. Reclaiming the space
+means deleting the loose store, after which reads resolve through the pack and a
+later `bit pack` carries the already-packed objects forward.
+
 Two formats are bit's own and git cannot read them: `.git/bitpack/` and the
 `refs/remotes/origin/*` that `bit fetch` writes. Neither is required, and
 `bit unpack` restores full git readability losslessly.
@@ -190,7 +195,7 @@ pull    11 reachable, 0 new
 
 | gain | cost |
 |---|---|
-| `bit pack`: 12.0 B/object index, 4.7× less disk | git cannot read the objects while packed. Reversible — `bit unpack` restores loose form, every object id verified identical |
+| `bit pack`: a 4.7× denser representation, 12.0 B/object index | git cannot read the objects while packed. Reversible — `bit unpack` restores loose form, every object verified against its digest before being written |
 | delta encoding: 2.3× smaller pack on real content | packing is 3.3× slower than `git gc --aggressive`, and a read may now apply a chain of up to 50 deltas |
 | 8-byte digest prefix | a *positive* existence check pays one decompression |
 | no CRC32 | objects cannot be copied between packs without inflating |

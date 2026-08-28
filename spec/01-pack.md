@@ -15,7 +15,9 @@ Packing solves two problems, and only one of them is compression:
 2. Objects can be stored adjacently, which enables cross-object delta. **We do
    not do this yet.** git does, and it is the remaining gap.
 
-Measured on 203 objects: 860,160 B loose → 184,320 B packed, **4.7×**. The
+Measured on 203 objects: 860,160 B loose → 184,320 B packed, **4.7×**. That is
+a comparison of two representations, not the effect of running `bit pack`, which
+leaves the loose store in place. The
 logical bytes barely moved. Almost the entire win was problem 1.
 
 ## Layout
