@@ -59,6 +59,30 @@ void index_free(bit_index *ix);
 /* Build tree objects from the index, returning the root tree. */
 int  tree_from_index(const bit_index *ix, oid *out);
 
+/* Read a working-tree path the way git hashes it: for a symlink the target
+ * path, for anything else the file contents. Callers that used slurp() here
+ * silently hashed the link's target instead of the link. */
+char *worktree_read(const char *full, size_t *len, int *is_link);
+
+/* --- allocation ---
+ * Every allocation in bit goes through these. A failed malloc in a version
+ * control system must not be a NULL dereference three frames later; it must be
+ * a clear message and a non-zero exit, before anything is written. */
+void *xmalloc(size_t n);
+void *xrealloc(void *p, size_t n);
+void *xcalloc(size_t n, size_t sz);
+char *xstrdup(const char *s);
+
+/* --- oid set ---
+ * A growable set, so ancestry walks and object enumeration have no fixed
+ * ceiling. Membership is a hash probe rather than a scan: merge_base was
+ * O(n^2) in ancestry depth. */
+typedef struct { oid *v; size_t n, cap; unsigned char *used; size_t hn; } oidset;
+void oidset_init(oidset *s);
+int  oidset_add(oidset *s, const oid *o);   /* 1 if newly added, 0 if present */
+int  oidset_has(const oidset *s, const oid *o);
+void oidset_free(oidset *s);
+
 /* --- misc --- */
 void die(const char *fmt, ...);
 char *slurp(const char *path, size_t *len);

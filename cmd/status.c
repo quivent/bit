@@ -22,7 +22,7 @@ static int collect(const char *path, uint32_t mode, const oid *id, void *ctx) {
     (void)mode;
     head_set *h = ctx;
     if (h->n == h->cap) { h->cap = h->cap ? h->cap * 2 : 128;
-                          h->e = realloc(h->e, h->cap * sizeof *h->e); }
+                          h->e = xrealloc(h->e, h->cap * sizeof *h->e); }
     h->e[h->n].id = *id;
     snprintf(h->e[h->n].path, sizeof h->e[h->n].path, "%s", path);
     h->n++;
@@ -86,9 +86,10 @@ int cmd_main(int argc, char **argv) {
 
         char full[1300]; snprintf(full, sizeof full, "%s/%s", root, e->path);
         char work = ' ';
-        if (access(full, F_OK) < 0) work = 'D';
+        struct stat wst;
+        if (lstat(full, &wst) < 0) work = 'D';            /* a dangling link exists */
         else if (!entry_matches_stat(e, full)) {          /* stat differs: now hash */
-            size_t len; char *data = slurp(full, &len);
+            size_t len; char *data = worktree_read(full, &len, 0);
             if (data) { oid now; object_write("blob", data, len, 0, &now);
                         if (!oid_eq(&now, &e->id)) work = 'M';
                         free(data); }

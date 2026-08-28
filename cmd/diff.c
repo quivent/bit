@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 /* diff — working tree against the index, or with --cached, the index against
  * HEAD. Files whose stat still matches the index are skipped without being
@@ -16,7 +17,7 @@ static int collect(const char *path, uint32_t mode, const oid *id, void *ctx) {
     (void)mode;
     tset *t = ctx;
     if (t->n == t->cap) { t->cap = t->cap ? t->cap * 2 : 128;
-                          t->e = realloc(t->e, t->cap * sizeof *t->e); }
+                          t->e = xrealloc(t->e, t->cap * sizeof *t->e); }
     t->e[t->n].id = *id;
     snprintf(t->e[t->n].path, sizeof t->e[t->n].path, "%s", path);
     t->n++;
@@ -74,9 +75,10 @@ int cmd_main(int argc, char **argv) {
             continue;
         }
         char full[1300]; snprintf(full, sizeof full, "%s/%s", root, e->path);
-        if (access(full, F_OK) < 0) { show(e->path, &e->id, "", 0); continue; }
+        struct stat wst;
+        if (lstat(full, &wst) < 0) { show(e->path, &e->id, "", 0); continue; }
         if (entry_matches_stat(e, full)) continue;             /* stat says unchanged */
-        size_t len; char *cur = slurp(full, &len);
+        size_t len; char *cur = worktree_read(full, &len, 0);
         if (!cur) continue;
         show(e->path, &e->id, cur, len);
         free(cur);

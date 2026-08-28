@@ -13,7 +13,7 @@ static int collect(const char *path, uint32_t mode, const oid *id, void *ctx) {
     (void)mode;
     tset *t = ctx;
     if (t->n == t->cap) { t->cap = t->cap ? t->cap * 2 : 128;
-                          t->e = realloc(t->e, t->cap * sizeof *t->e); }
+                          t->e = xrealloc(t->e, t->cap * sizeof *t->e); }
     t->e[t->n].id = *id;
     snprintf(t->e[t->n].path, sizeof t->e[t->n].path, "%s", path);
     t->n++;

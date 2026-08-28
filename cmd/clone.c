@@ -37,7 +37,7 @@ int cmd_main(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/refs", dg);       mkdir(p, 0755);
     snprintf(p, sizeof p, "%s/refs/heads", dg); mkdir(p, 0755);
 
-    oid *objs = malloc(200000 * sizeof *objs);
+    oid *objs = xmalloc(200000 * sizeof *objs);
     int n = reachable_in(src, &head, objs, 200000);
     int sent = 0;
     for (int i = 0; i < n; i++) if (object_copy(src, dg, &objs[i]) == 1) sent++;

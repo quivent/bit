@@ -168,21 +168,11 @@ pull    11 reachable, 0 new
 - **Benchmark variance** reaches ~0.3 ms on millisecond arms. Only rows gathered
   in one batch may be compared, which is why `vs-git.sh` gathers all of them.
 
-### Hard limits
+### Limits
 
-These are fixed sizes in the source. None is reached by ordinary use; all of
-them truncate silently rather than failing loudly, which is the wrong behaviour
-and is not yet fixed.
-
-| limit | value | consequence |
-|---|---|---|
-| `merge_base` ancestry | 4,096 commits per side | a base further back is not found |
-| `reachable_in` queue | 4,096 commits | a longer history truncates during transfer |
-| `pack_read` candidates | 8 sharing a digest prefix | balls-in-bins puts the real maximum at 1–2 |
-| `clone`/`fetch`/`push` | 200,000 objects | larger transfers truncate |
-
-`merge_base` also scans its visited list linearly, so it is O(n²) in ancestry
-depth.
+`clone`, `fetch` and `push` enumerate into a 200,000-object buffer and **fail
+loudly** if a repository exceeds it. Nothing else has a fixed ceiling: ancestry
+walks, object enumeration and digest-prefix candidate lists all grow.
 
 ## Audit
 
@@ -197,16 +187,43 @@ hostile input, and pathological content.
 | binary files, empty files, no trailing newline | `write-tree` matches git exactly |
 | no-trailing-newline diff | matches git, including the `\ No newline` marker |
 | directory nesting to 100 levels | matches git exactly |
+| symlinks, absolute, relative and dangling | all three match git, mode 120000 |
+| 4,200-commit history | `merge_base` and `log` walk it; `git fsck` 0 |
 
-**One real defect was found and fixed.** `build_tree` held a 4,096-entry array
-of ~540-byte structs on the stack — a 2.1 MB frame *per recursion level* — which
-overflowed an 8 MB stack at three levels of directory nesting. git handled the
-same tree. Every fixture in the test suite nested exactly two levels, so nothing
-caught it. The array is now heap-allocated and grows, and `parity.sh` asserts a
-60-level tree.
+### Defects found and fixed
 
-Known and unfixed: 31 of 32 allocations are unchecked for `NULL`, and the hard
-limits above truncate silently.
+**Stack overflow at three levels of nesting.** `build_tree` held a 4,096-entry
+array of ~540-byte structs on the stack — a 2.1 MB frame *per recursion level* —
+which overflowed an 8 MB stack at a three-deep directory tree. git handled the
+same tree. Every fixture nested exactly two levels, so nothing reached it. The
+array is now on the heap and grows; `write-tree` matches git to 100 levels and
+`parity.sh` asserts 60.
+
+**Symlinks were stored as their targets' contents.** `add` used `stat()` and
+`slurp()`, both of which follow a link, so a symlink became a mode-100644 blob
+holding the bytes of whatever it pointed at — a different tree from git's, and a
+different working directory on checkout. A dangling link made `add` fail
+outright and vanish from the index. This was worse than the stack overflow: it
+wrote wrong data silently rather than crashing. `add` now uses `lstat` and
+`readlink`, `checkout` recreates real links, `status` and `diff` read the link
+rather than its target, and all four symlink modes match git exactly.
+
+**Unbounded walks were silently truncated.** `merge_base` and `reachable_in` had
+4,096-entry stack arrays and scanned membership linearly, making `merge_base`
+O(n²) in ancestry depth. Both now use a growable hash set; verified against a
+4,200-commit history.
+
+**Every allocation was unchecked.** 31 of 32 call sites could dereference a
+`NULL` from a failed `malloc`. All allocation now routes through wrappers that
+report and exit before anything is written.
+
+**`typeof` is a GNU extension**, caught only by `-std=c11`, and would not have
+compiled under a strict toolchain.
+
+Nothing is currently known-broken. The tests that would have caught these —
+deep nesting, symlinks, long histories — now exist, which is the part that
+matters, since each of these defects was invisible to a suite whose fixtures
+were all two levels deep and symlink-free.
 
 ## Reproducing
 

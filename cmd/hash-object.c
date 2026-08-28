@@ -15,11 +15,11 @@ int cmd_main(int argc, char **argv) {
     }
     char *data; size_t len;
     if (stdin_mode) {
-        size_t cap = 1 << 16; len = 0; data = malloc(cap);
+        size_t cap = 1 << 16; len = 0; data = xmalloc(cap);
         ssize_t n;
         while ((n = read(0, data + len, cap - len)) > 0) {
             len += (size_t)n;
-            if (len == cap) { cap *= 2; data = realloc(data, cap); }
+            if (len == cap) { cap *= 2; data = xrealloc(data, cap); }
         }
     } else if (path) {
         data = slurp(path, &len);

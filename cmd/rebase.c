@@ -17,7 +17,7 @@ typedef struct { tent *e; size_t n, cap; } tset;
 static int collect(const char *path, uint32_t mode, const oid *id, void *ctx) {
     tset *t = ctx;
     if (t->n == t->cap) { t->cap = t->cap ? t->cap * 2 : 128;
-                          t->e = realloc(t->e, t->cap * sizeof *t->e); }
+                          t->e = xrealloc(t->e, t->cap * sizeof *t->e); }
     t->e[t->n].id = *id; t->e[t->n].mode = mode;
     snprintf(t->e[t->n].path, sizeof t->e[t->n].path, "%s", path);
     t->n++;
@@ -66,7 +66,7 @@ static char *message_of(const oid *c) {
     char *b = object_read(c, type, sizeof type, &len);
     if (!b) return 0;
     char *m = strstr(b, "\n\n");
-    char *out = strdup(m ? m + 2 : "replayed");
+    char *out = xstrdup(m ? m + 2 : "replayed");
     free(b);
     char *nl = strchr(out, '\n'); if (nl) *nl = 0;
     return out;

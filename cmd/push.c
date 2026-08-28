@@ -33,7 +33,7 @@ int cmd_main(int argc, char **argv) {
         free(s);
     }
 
-    oid *objs = malloc(200000 * sizeof *objs);
+    oid *objs = xmalloc(200000 * sizeof *objs);
     int n = reachable(&ours, objs, 200000);
     int sent = 0;
     for (int i = 0; i < n; i++) if (object_copy(git, dst, &objs[i]) == 1) sent++;

@@ -58,7 +58,21 @@ mkdir -p "$deep" && printf 'bottom\n' > "$deep/f.txt"
 "$B/add" d >/dev/null
 cmp2 "write-tree at 60 levels" "$("$B/write-tree")" "$(git write-tree)"
 
-# 7. bit's own log agrees with git's
+# 7. symlinks. A regression test: `add` used stat() and slurp(), which follow a
+# link, so a symlink was stored as its target's contents under mode 100644 --
+# a different tree from git's, and a different working directory on checkout.
+# A dangling link made `add` fail outright. No fixture had a symlink.
+printf 'linked\n' > lt.txt
+ln -s lt.txt sl.txt
+ln -s nowhere-at-all sl-broken.txt
+"$B/add" lt.txt sl.txt sl-broken.txt >/dev/null
+cmp2 "write-tree with symlinks" "$("$B/write-tree")" "$(git write-tree)"
+modes=$(git ls-files -s | awk '$1=="120000"' | wc -l | tr -d ' ')
+[ "$modes" = "2" ] && ok "both symlinks recorded as mode 120000" \
+                   || bad "symlink modes" "$modes" "2"
+
+# 8. bit's own log agrees with git's
+
 
 cmp2 "bit log == git log" "$("$B/log" --oneline)" "$(git log --oneline)"
 

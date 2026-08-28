@@ -10,7 +10,28 @@
 static int stage(bit_index *ix, const char *root, const char *rel) {
     char full[1400]; snprintf(full, sizeof full, "%s/%s", root, rel);
     struct stat st;
-    if (stat(full, &st) < 0) { fprintf(stderr, "bit: cannot stat %s\n", rel); return 1; }
+    /* lstat, not stat. A symlink is an object in its own right: git stores it
+       as mode 120000 whose content is the target path. Following it stores the
+       target's bytes under the link's name, which is a different tree and, on
+       checkout, a different working directory. */
+    if (lstat(full, &st) < 0) { fprintf(stderr, "bit: cannot stat %s\n", rel); return 1; }
+
+    if (S_ISLNK(st.st_mode)) {
+        char target[4096];
+        ssize_t tl = readlink(full, target, sizeof target - 1);
+        if (tl < 0) { fprintf(stderr, "bit: cannot read link %s\n", rel); return 1; }
+        target[tl] = 0;                       /* dangling links read fine */
+        bit_entry e; memset(&e, 0, sizeof e);
+        object_write("blob", target, (size_t)tl, 1, &e.id);
+        snprintf(e.path, sizeof e.path, "%s", rel);
+        e.mode  = 0120000;
+        e.size  = (uint32_t)tl;
+        e.mtime = (uint32_t)st.st_mtime; e.ctime = (uint32_t)st.st_ctime;
+        e.dev   = (uint32_t)st.st_dev;   e.ino   = (uint32_t)st.st_ino;
+        e.uid   = (uint32_t)st.st_uid;   e.gid   = (uint32_t)st.st_gid;
+        index_upsert(ix, &e);
+        return 0;
+    }
 
     if (S_ISDIR(st.st_mode)) {
         /* Walk with readdir rather than popen("find"). The subprocess cost

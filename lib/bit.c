@@ -47,7 +47,7 @@ char *slurp(const char *path, size_t *len) {
     if (fd < 0) return 0;
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return 0; }
-    char *buf = malloc((size_t)st.st_size + 1);
+    char *buf = xmalloc((size_t)st.st_size + 1);
     if (!buf) { close(fd); return 0; }
     ssize_t n = read(fd, buf, (size_t)st.st_size);
     close(fd);
@@ -55,6 +55,103 @@ char *slurp(const char *path, size_t *len) {
     buf[n] = 0;
     if (len) *len = (size_t)n;
     return buf;
+}
+
+/* ---- allocation ---- */
+
+void *xmalloc(size_t n) {
+    void *p = malloc(n ? n : 1);
+    if (!p) die("out of memory allocating %zu bytes", n);
+    return p;
+}
+void *xrealloc(void *p, size_t n) {
+    void *q = realloc(p, n ? n : 1);
+    if (!q) die("out of memory reallocating %zu bytes", n);
+    return q;
+}
+void *xcalloc(size_t n, size_t sz) {
+    void *p = calloc(n ? n : 1, sz ? sz : 1);
+    if (!p) die("out of memory allocating %zu x %zu", n, sz);
+    return p;
+}
+char *xstrdup(const char *s) {
+    char *p = strdup(s);
+    if (!p) die("out of memory duplicating a string");
+    return p;
+}
+
+/* ---- oid set ----
+ * Open addressing over a power-of-two table of indices into a dense array, so
+ * membership is a probe and iteration is a walk. The dense array is what the
+ * callers want; the table exists only to make `has` constant time. */
+
+#define OIDSET_EMPTY ((size_t)-1)
+
+static size_t oid_hash(const oid *o) {
+    size_t h = 0;
+    memcpy(&h, o->b, sizeof h < OID_RAW ? sizeof h : OID_RAW);
+    return h;
+}
+static size_t *oidset_slots(const oidset *s) { return (size_t *)s->used; }
+
+void oidset_init(oidset *s) {
+    s->n = 0; s->cap = 0; s->v = 0; s->hn = 64;
+    s->used = xmalloc(s->hn * sizeof(size_t));
+    size_t *t = oidset_slots(s);
+    for (size_t i = 0; i < s->hn; i++) t[i] = OIDSET_EMPTY;
+}
+static void oidset_rehash(oidset *s) {
+    size_t nn = s->hn * 2;
+    size_t *t = xmalloc(nn * sizeof(size_t));
+    for (size_t i = 0; i < nn; i++) t[i] = OIDSET_EMPTY;
+    for (size_t i = 0; i < s->n; i++) {
+        size_t j = oid_hash(&s->v[i]) & (nn - 1);
+        while (t[j] != OIDSET_EMPTY) j = (j + 1) & (nn - 1);
+        t[j] = i;
+    }
+    free(s->used);
+    s->used = (unsigned char *)t;
+    s->hn = nn;
+}
+int oidset_has(const oidset *s, const oid *o) {
+    if (!s->used) return 0;
+    size_t *t = oidset_slots(s);
+    size_t j = oid_hash(o) & (s->hn - 1);
+    while (t[j] != OIDSET_EMPTY) {
+        if (oid_eq(&s->v[t[j]], o)) return 1;
+        j = (j + 1) & (s->hn - 1);
+    }
+    return 0;
+}
+int oidset_add(oidset *s, const oid *o) {
+    if (!s->used) oidset_init(s);
+    if (oidset_has(s, o)) return 0;
+    if (s->n == s->cap) { s->cap = s->cap ? s->cap * 2 : 64;
+                          s->v = xrealloc(s->v, s->cap * sizeof *s->v); }
+    s->v[s->n] = *o;
+    size_t *t = oidset_slots(s);
+    size_t j = oid_hash(o) & (s->hn - 1);
+    while (t[j] != OIDSET_EMPTY) j = (j + 1) & (s->hn - 1);
+    t[j] = s->n;
+    s->n++;
+    if (s->n * 2 >= s->hn) oidset_rehash(s);
+    return 1;
+}
+void oidset_free(oidset *s) { free(s->v); free(s->used); s->v = 0; s->used = 0; s->n = s->cap = 0; }
+
+char *worktree_read(const char *full, size_t *len, int *is_link) {
+    struct stat st;
+    if (lstat(full, &st) < 0) return 0;
+    if (is_link) *is_link = S_ISLNK(st.st_mode);
+    if (S_ISLNK(st.st_mode)) {
+        char *buf = xmalloc(4097);
+        ssize_t tl = readlink(full, buf, 4096);
+        if (tl < 0) { free(buf); return 0; }
+        buf[tl] = 0;
+        if (len) *len = (size_t)tl;
+        return buf;
+    }
+    return slurp(full, len);
 }
 
 /* ---- repository discovery ---- */
@@ -106,12 +203,12 @@ int object_write(const char *type, const void *data, size_t len, int write_it, o
     if (object_exists(out)) return 0;                 /* immutable; already there */
 
     size_t raw = (size_t)hlen + len;
-    unsigned char *buf = malloc(raw);
+    unsigned char *buf = xmalloc(raw);
     memcpy(buf, hdr, hlen);
     memcpy(buf + hlen, data, len);
 
     uLongf zcap = compressBound((uLong)raw);
-    unsigned char *z = malloc(zcap);
+    unsigned char *z = xmalloc(zcap);
     if (compress2(z, &zcap, buf, (uLong)raw, Z_DEFAULT_COMPRESSION) != Z_OK)
         die("compression failed");
 
@@ -135,10 +232,10 @@ void *object_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out
     if (!z) return pack_read(o, type_out, type_cap, len_out);   /* loose, then pack */
 
     size_t cap = zlen * 6 + 8192;
-    unsigned char *buf = malloc(cap);
+    unsigned char *buf = xmalloc(cap);
     uLongf got = (uLongf)cap;
     while (uncompress(buf, &got, (unsigned char *)z, (uLong)zlen) == Z_BUF_ERROR) {
-        cap *= 4; buf = realloc(buf, cap); got = (uLongf)cap;
+        cap *= 4; buf = xrealloc(buf, cap); got = (uLongf)cap;
     }
     free(z);
 
@@ -149,7 +246,7 @@ void *object_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out
                     memcpy(type_out, buf, n); type_out[n] = 0; }
     size_t hlen = (size_t)(nul - buf) + 1;
     size_t clen = got - hlen;
-    unsigned char *content = malloc(clen + 1);
+    unsigned char *content = xmalloc(clen + 1);
     memcpy(content, buf + hlen, clen);
     content[clen] = 0;
     free(buf);
@@ -225,7 +322,7 @@ void index_upsert(bit_index *ix, const bit_entry *e) {
     at = lo;                                            /* sorted insertion point */
     if (ix->n == ix->cap) {
         ix->cap = ix->cap ? ix->cap * 2 : 64;
-        ix->e = realloc(ix->e, ix->cap * sizeof *ix->e);
+        ix->e = xrealloc(ix->e, ix->cap * sizeof *ix->e);
     }
     if ((size_t)at < ix->n)
         memmove(&ix->e[at + 1], &ix->e[at], (ix->n - (size_t)at) * sizeof *ix->e);
@@ -274,7 +371,7 @@ int index_read(bit_index *ix) {
 int index_write(const bit_index *ix) {
     char git[1024]; if (repo_git_dir(git, sizeof git) < 0) return -1;
     size_t cap = 12 + ix->n * (62 + 512 + 8) + 20;
-    unsigned char *buf = calloc(1, cap), *p = buf;
+    unsigned char *buf = xcalloc(1, cap), *p = buf;
     memcpy(p, "DIRC", 4); p += 4;
     put32(&p, 2); put32(&p, (uint32_t)ix->n);
     for (size_t i = 0; i < ix->n; i++) {
@@ -328,7 +425,7 @@ static int build_tree(const bit_index *ix, const char *prefix, oid *out) {
        because every fixture nested only two. */
     typedef struct { char name[512]; int is_dir; oid id; uint32_t mode; } kid_t;
     size_t nk = 0, kcap = 64;
-    kid_t *kids = malloc(kcap * sizeof *kids);
+    kid_t *kids = xmalloc(kcap * sizeof *kids);
     if (!kids) return -1;
 
     for (size_t i = 0; i < ix->n; i++) {
@@ -346,7 +443,7 @@ static int build_tree(const bit_index *ix, const char *prefix, oid *out) {
 
         if (nk == kcap) {
             kcap *= 2;
-            kid_t *grown = realloc(kids, kcap * sizeof *kids);
+            kid_t *grown = xrealloc(kids, kcap * sizeof *kids);
             if (!grown) { free(kids); return -1; }
             kids = grown;
         }
@@ -367,11 +464,11 @@ static int build_tree(const bit_index *ix, const char *prefix, oid *out) {
     for (size_t a = 0; a + 1 < nk; a++)                    /* insertion sort, git order */
         for (size_t b = a + 1; b < nk; b++)
             if (tree_name_cmp(kids[a].name, kids[a].is_dir, kids[b].name, kids[b].is_dir) > 0) {
-                typeof(kids[0]) t = kids[a]; kids[a] = kids[b]; kids[b] = t;
+                kid_t t = kids[a]; kids[a] = kids[b]; kids[b] = t;
             }
 
     size_t cap = nk * 560 + 64, len = 0;
-    unsigned char *buf = malloc(cap);
+    unsigned char *buf = xmalloc(cap);
     for (size_t i = 0; i < nk; i++) {
         len += (size_t)snprintf((char *)buf + len, cap - len, "%o %s",
                                 kids[i].mode, kids[i].name);
@@ -454,13 +551,13 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
             void *data = object_read(&o, type, sizeof type, &len);
             if (!data) continue;
 
-            if (n == cap) { cap = cap ? cap * 2 : 256; ents = realloc(ents, cap * sizeof *ents); }
+            if (n == cap) { cap = cap ? cap * 2 : 256; ents = xrealloc(ents, cap * sizeof *ents); }
             ents[n].id = o;
             ents[n].off = (uint32_t)ftell(pf);
             n++;
 
             uLongf zcap = compressBound((uLong)len);
-            unsigned char *z = malloc(zcap);
+            unsigned char *z = xmalloc(zcap);
             compress2(z, &zcap, data, (uLong)len, Z_DEFAULT_COMPRESSION);
             fputc(type_code(type), pf);
             put_varint(pf, len);
@@ -513,9 +610,14 @@ void *pack_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out) 
     /* Entries sharing a prefix are adjacent, because the index is sorted on it.
        Rewind to the first, then try each until one rehashes to the full oid. */
     while (hit > 0 && memcmp(ix + 12 + (hit - 1) * IDX_SLOT, o->b, IDX_PREFIX) == 0) hit--;
-    uint32_t cand[8]; int ncand = 0;
-    for (long j = hit; j < (long)n && ncand < 8; j++) {
+    /* Grown rather than capped. Balls-in-bins puts the real maximum run at 1-2
+       for any plausible object count, but a fixed array here would drop a
+       candidate silently, and the dropped one could be the object asked for. */
+    uint32_t *cand = 0; int ncand = 0, ccap = 0;
+    for (long j = hit; j < (long)n; j++) {
         if (memcmp(ix + 12 + j * IDX_SLOT, o->b, IDX_PREFIX) != 0) break;
+        if (ncand == ccap) { ccap = ccap ? ccap * 2 : 8;
+                             cand = xrealloc(cand, (size_t)ccap * sizeof *cand); }
         memcpy(&cand[ncand++], ix + 12 + j * IDX_SLOT + IDX_PREFIX, 4);
     }
     free(ix);
@@ -528,7 +630,7 @@ void *pack_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out) 
         const unsigned char *p = pk + off;
         int tc = *p++;
         uint64_t ulen = get_varint(&p), zlen = get_varint(&p);
-        unsigned char *out = malloc(ulen + 1);
+        unsigned char *out = xmalloc(ulen + 1);
         uLongf got = (uLongf)ulen;
         if (uncompress(out, &got, p, (uLong)zlen) != Z_OK) { free(out); continue; }
         out[ulen] = 0;
@@ -600,7 +702,7 @@ int pack_unpack(int *n_out) {
     for (uint32_t i = 0; i < n && (size_t)(p - pk) < plen; i++) {
         int tc = *p++;
         uint64_t ulen = get_varint(&p), zlen = get_varint(&p);
-        unsigned char *out = malloc(ulen + 1);
+        unsigned char *out = xmalloc(ulen + 1);
         uLongf got = (uLongf)ulen;
         if (uncompress(out, &got, p, (uLong)zlen) != Z_OK) { free(out); break; }
         p += zlen;
@@ -642,12 +744,12 @@ typedef struct { const char *p; size_t n; } line;
 
 static line *split_lines(const char *s, size_t len, size_t *n_out) {
     size_t cap = 64, n = 0;
-    line *v = malloc(cap * sizeof *v);
+    line *v = xmalloc(cap * sizeof *v);
     const char *p = s, *end = s + len;
     while (p < end) {
         const char *nl = memchr(p, '\n', (size_t)(end - p));
         size_t l = nl ? (size_t)(nl - p) + 1 : (size_t)(end - p);
-        if (n == cap) { cap *= 2; v = realloc(v, cap * sizeof *v); }
+        if (n == cap) { cap *= 2; v = xrealloc(v, cap * sizeof *v); }
         v[n].p = p; v[n].n = l; n++;
         p += l;
     }
@@ -668,13 +770,13 @@ static void emit(FILE *out, char sign, const line *l) {
 static void myers(FILE *out, const line *a, int n, const line *b, int m) {
     int max = n + m;
     if (max == 0) return;
-    int *v = malloc((size_t)(2 * max + 1) * sizeof *v);
-    int **trace = malloc((size_t)(max + 1) * sizeof *trace);
+    int *v = xmalloc((size_t)(2 * max + 1) * sizeof *v);
+    int **trace = xmalloc((size_t)(max + 1) * sizeof *trace);
     int off = max, depth = -1;
     memset(v, 0, (size_t)(2 * max + 1) * sizeof *v);
 
     for (int d = 0; d <= max; d++) {
-        trace[d] = malloc((size_t)(2 * max + 1) * sizeof **trace);
+        trace[d] = xmalloc((size_t)(2 * max + 1) * sizeof **trace);
         memcpy(trace[d], v, (size_t)(2 * max + 1) * sizeof *v);
         for (int k = -d; k <= d; k += 2) {
             int x = (k == -d || (k != d && v[off + k - 1] < v[off + k + 1]))
@@ -688,7 +790,7 @@ static void myers(FILE *out, const line *a, int n, const line *b, int m) {
 done:
     if (depth < 0) depth = max;
     /* walk the trace backwards into an edit script, then replay it forwards */
-    int *ops = malloc((size_t)(max + 1) * 2 * sizeof *ops), nops = 0;
+    int *ops = xmalloc((size_t)(max + 1) * 2 * sizeof *ops), nops = 0;
     int x = n, y = m;
     for (int d = depth; d > 0; d--) {
         int *pv = trace[d];      /* V before expansion d = state after d-1 */
@@ -773,7 +875,8 @@ static void stamp(bit_entry *e, const char *path, const oid *id, uint32_t mode, 
     memset(e, 0, sizeof *e);
     snprintf(e->path, sizeof e->path, "%s", path);
     e->id = *id;
-    e->mode  = (mode & 0111) ? 0100755 : 0100644;
+    e->mode  = (mode & 0170000) == 0120000 ? 0120000
+             : (mode & 0111) ? 0100755 : 0100644;
     e->size  = (uint32_t)st->st_size;  e->mtime = (uint32_t)st->st_mtime;
     e->ctime = (uint32_t)st->st_ctime; e->dev   = (uint32_t)st->st_dev;
     e->ino   = (uint32_t)st->st_ino;   e->uid   = (uint32_t)st->st_uid;
@@ -807,12 +910,23 @@ static int co_put(const char *path, uint32_t mode, const oid *id, void *v) {
     void *data = object_read(id, type, sizeof type, &len);
     if (!data) { fprintf(stderr, "bit: missing object for %s\n", path); return 1; }
     mkparents(full);
+    if ((mode & 0170000) == 0120000) {        /* restore a symlink, not a file */
+        char t[4097];
+        size_t tl = len < sizeof t - 1 ? len : sizeof t - 1;
+        memcpy(t, data, tl); t[tl] = 0;
+        free(data);
+        unlink(full);
+        if (symlink(t, full) < 0) { fprintf(stderr, "bit: cannot link %s\n", path); return 1; }
+        if (lstat(full, &st) == 0) { bit_entry e; stamp(&e, path, id, mode, &st); index_upsert(c->ix, &e); }
+        c->n++;
+        return 0;
+    }
     int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, (mode & 0111) ? 0755 : 0644);
     if (fd < 0) { free(data); fprintf(stderr, "bit: cannot write %s\n", path); return 1; }
     ssize_t w = write(fd, data, len);
     close(fd); free(data);
     if (w != (ssize_t)len) return 1;
-    if (stat(full, &st) == 0) { bit_entry e; stamp(&e, path, id, mode, &st); index_upsert(c->ix, &e); }
+    if (lstat(full, &st) == 0) { bit_entry e; stamp(&e, path, id, mode, &st); index_upsert(c->ix, &e); }
     c->n++;
     return 0;
 }
@@ -874,37 +988,40 @@ int commit_parents(const oid *c, oid *p1, oid *p2) {
 /* Collect every ancestor of `a`, then walk `b`'s ancestry until one is hit.
  * Breadth-first on b, so the first hit is the nearest common ancestor. */
 int merge_base(const oid *a, const oid *b, oid *out) {
-    oid seen[4096]; size_t nseen = 0;
-    oid queue[4096]; size_t qh = 0, qt = 0;
-    queue[qt++] = *a;
-    while (qh < qt && nseen < 4096) {
-        oid c = queue[qh++];
-        int dup = 0;
-        for (size_t i = 0; i < nseen; i++) if (oid_eq(&seen[i], &c)) { dup = 1; break; }
-        if (dup) continue;
-        seen[nseen++] = c;
+    /* Every ancestor of `a`, then a breadth-first walk of `b` until one is hit,
+       so the first hit is the nearest common ancestor. Both the frontier and
+       the visited set grow; there is no ancestry depth at which this silently
+       stops searching. Membership is a hash probe, not a scan. */
+    oidset seen, visited;
+    oidset_init(&seen); oidset_init(&visited);
+    oid *q = 0; size_t qn = 0, qcap = 0, qh = 0;
+    #define PUSH(x) do { if (qn == qcap) { qcap = qcap ? qcap * 2 : 64; \
+                          q = xrealloc(q, qcap * sizeof *q); } q[qn++] = (x); } while (0)
+
+    PUSH(*a);
+    while (qh < qn) {
+        oid c = q[qh++];
+        if (!oidset_add(&seen, &c)) continue;
         oid p1, p2;
         int np = commit_parents(&c, &p1, &p2);
-        if (np > 0 && qt < 4096) queue[qt++] = p1;
-        if (np > 1 && qt < 4096) queue[qt++] = p2;
+        if (np > 0) PUSH(p1);
+        if (np > 1) PUSH(p2);
     }
-    qh = qt = 0;
-    queue[qt++] = *b;
-    oid visited[4096]; size_t nv = 0;
-    while (qh < qt) {
-        oid c = queue[qh++];
-        int dup = 0;
-        for (size_t i = 0; i < nv; i++) if (oid_eq(&visited[i], &c)) { dup = 1; break; }
-        if (dup) continue;
-        if (nv < 4096) visited[nv++] = c;
-        for (size_t i = 0; i < nseen; i++)
-            if (oid_eq(&seen[i], &c)) { *out = c; return 0; }
+    qn = qh = 0;
+    PUSH(*b);
+    int found = -1;
+    while (qh < qn) {
+        oid c = q[qh++];
+        if (!oidset_add(&visited, &c)) continue;
+        if (oidset_has(&seen, &c)) { *out = c; found = 0; break; }
         oid p1, p2;
         int np = commit_parents(&c, &p1, &p2);
-        if (np > 0 && qt < 4096) queue[qt++] = p1;
-        if (np > 1 && qt < 4096) queue[qt++] = p2;
+        if (np > 0) PUSH(p1);
+        if (np > 1) PUSH(p2);
     }
-    return -1;
+    #undef PUSH
+    free(q); oidset_free(&seen); oidset_free(&visited);
+    return found;
 }
 
 /* ---- transport ---- */
@@ -945,10 +1062,10 @@ static void *object_read_in(const char *gitdir, const oid *o, char *type_out,
     size_t zlen; char *z = slurp(p, &zlen);
     if (!z) return 0;
     size_t cap = zlen * 6 + 8192;
-    unsigned char *buf = malloc(cap);
+    unsigned char *buf = xmalloc(cap);
     uLongf got = (uLongf)cap;
     while (uncompress(buf, &got, (unsigned char *)z, (uLong)zlen) == Z_BUF_ERROR) {
-        cap *= 4; buf = realloc(buf, cap); got = (uLongf)cap;
+        cap *= 4; buf = xrealloc(buf, cap); got = (uLongf)cap;
     }
     free(z);
     unsigned char *nul = memchr(buf, 0, got);
@@ -957,16 +1074,22 @@ static void *object_read_in(const char *gitdir, const oid *o, char *type_out,
                     if (n >= type_cap) n = type_cap - 1;
                     memcpy(type_out, buf, n); type_out[n] = 0; }
     size_t hlen = (size_t)(nul - buf) + 1, clen = got - hlen;
-    unsigned char *c = malloc(clen + 1);
+    unsigned char *c = xmalloc(clen + 1);
     memcpy(c, buf + hlen, clen); c[clen] = 0;
     free(buf);
     if (len_out) *len_out = clen;
     return c;
 }
 
+/* Records into the caller's array, but membership is tested against a set, so
+   enumeration is linear rather than quadratic in object count. Overflowing the
+   caller's capacity is reported, never silently truncated. */
+static int seen_overflow;
+static oidset seen_set;
+
 static int seen_add(oid *out, int *n, int cap, const oid *o) {
-    for (int i = 0; i < *n; i++) if (oid_eq(&out[i], o)) return 0;
-    if (*n >= cap) return 0;
+    if (!oidset_add(&seen_set, o)) return 0;
+    if (*n >= cap) { seen_overflow = 1; return 0; }
     out[(*n)++] = *o;
     return 1;
 }
@@ -992,9 +1115,14 @@ static void walk_tree_in(const char *gitdir, const oid *t, oid *out, int *n, int
 
 int reachable_in(const char *gitdir, const oid *from, oid *out, int cap) {
     int n = 0;
-    oid queue[4096]; int qh = 0, qt = 0;
-    queue[qt++] = *from;
-    while (qh < qt) {
+    seen_overflow = 0;
+    oidset_init(&seen_set);
+    oid *queue = 0; size_t qn = 0, qcap = 0; int qh = 0;
+    #define QPUSH(x) do { if (qn == qcap) { qcap = qcap ? qcap * 2 : 64; \
+                           queue = xrealloc(queue, qcap * sizeof *queue); } \
+                          queue[qn++] = (x); } while (0)
+    QPUSH(*from);
+    while ((size_t)qh < qn) {
         oid c = queue[qh++];
         if (!seen_add(out, &n, cap, &c)) continue;
         char type[32]; size_t len;
@@ -1009,13 +1137,17 @@ int reachable_in(const char *gitdir, const oid *from, oid *out, int cap) {
                 if (!strncmp(p, "parent ", 7)) {
                     char hex[OID_HEX + 1]; memcpy(hex, p + 7, OID_HEX); hex[OID_HEX] = 0;
                     oid pp;
-                    if (!oid_from_hex(hex, &pp) && qt < 4096) queue[qt++] = pp;
+                    if (!oid_from_hex(hex, &pp)) QPUSH(pp);
                 }
                 char *nl = strchr(p, '\n'); p = nl ? nl + 1 : 0;
             }
         }
         free(body);
     }
+    #undef QPUSH
+    free(queue);
+    oidset_free(&seen_set);
+    if (seen_overflow) die("more than %d objects reachable; raise the limit", cap);
     return n;
 }
 
@@ -1055,7 +1187,7 @@ int do_fetch(const char *remote, oid *head_out, char *branch_out, size_t bcap,
     if (oid_from_hex(s, &head) < 0) { free(s); return -1; }
     free(s);
 
-    oid *objs = malloc(200000 * sizeof *objs);
+    oid *objs = xmalloc(200000 * sizeof *objs);
     int n = reachable_in(src, &head, objs, 200000), sent = 0;
     for (int i = 0; i < n; i++) if (object_copy(src, git, &objs[i]) == 1) sent++;
     free(objs);
