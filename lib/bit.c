@@ -520,6 +520,13 @@ int tree_walk(const oid *tree, const char *prefix, tree_cb cb, void *ctx) {
     return rc;
 }
 
+struct delta_index_s;
+struct delta_index_s *delta_index_build(const unsigned char *base, size_t blen);
+void delta_index_free(struct delta_index_s *ix);
+unsigned char *delta_create_indexed(const struct delta_index_s *ix,
+                                    const unsigned char *base, size_t blen,
+                                    const unsigned char *tgt, size_t tlen, size_t *dlen);
+
 /* ---- pack ---- */
 
 /* Bounded: a pack is a file, and a file can be truncated or wrong. On a
@@ -693,7 +700,8 @@ static size_t varint_len(uint64_t v) { size_t n = 0; do { n++; v >>= 7; } while 
 /* A candidate delta base, held while the representation of each object is
    being decided. `rec` is a position in the record array, not a file offset:
    at this point nothing has been placed. */
-typedef struct { int tc; unsigned char *data; size_t len; long rec; int depth; } win_t;
+typedef struct { int tc; unsigned char *data; size_t len; long rec; int depth;
+                 struct delta_index_s *ix; } win_t;
 
 typedef struct { oid id; int tc; size_t size; } meta_t;
 static int meta_cmp(const void *a, const void *b) {
@@ -848,9 +856,10 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
         unsigned char *bestz = 0; size_t bestzlen = 0, bestraw = 0;
         long bestbase = -1; int bestdepth = 0, beststored = 0;
         for (int wi = 0; wi < nwin; wi++) {
-            if (win[wi].tc != tc || win[wi].depth >= DELTA_DEPTH) continue;
+            if (win[wi].tc != tc || win[wi].depth >= DELTA_DEPTH || !win[wi].ix) continue;
             size_t dl;
-            unsigned char *dd = delta_create(win[wi].data, win[wi].len, data, len, &dl);
+            unsigned char *dd = delta_create_indexed(win[wi].ix, win[wi].data,
+                                                     win[wi].len, data, len, &dl);
             if (!dd) continue;
             size_t zd = compressBound((uLong)dl) + 64;
             unsigned char *zz = xmalloc(zd);
@@ -891,13 +900,14 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
         where[i] = (long)nr;
         nr++;
 
-        free(win[wnext].data);
+        free(win[wnext].data); delta_index_free(win[wnext].ix);
         win[wnext].tc = tc; win[wnext].data = data; win[wnext].len = len;
+        win[wnext].ix = delta_index_build(data, len);   /* built once, used W times */
         win[wnext].rec = (long)(nr - 1); win[wnext].depth = r->depth;
         wnext = (wnext + 1) % DELTA_WIN;
         if (nwin < DELTA_WIN) nwin++;
     }
-    for (int wi = 0; wi < nwin; wi++) free(win[wi].data);
+    for (int wi = 0; wi < nwin; wi++) { free(win[wi].data); delta_index_free(win[wi].ix); }
     free(m); free(where);
 
     /* Pass 3: place. Sorting by digest puts every object in its bucket and the
@@ -1675,13 +1685,27 @@ int do_fetch(const char *remote, oid *head_out, char *branch_out, size_t bcap,
 #define DELTA_BLK 16                       /* match granularity */
 #endif
 #ifndef DELTA_STEP
-/* A quarter of the block size, not the whole of it. Indexing the base every
-   16 bytes finds a match only where 16 *aligned* bytes line up, which needs a
-   run of 31 to guarantee; at a stride of 4 a run of 19 suffices. Shared code
-   sits at unaligned offsets, so a stride equal to the block was throwing away
-   most of the matches actually present: on the git-core binaries, going from
-   stride 16 to stride 4 was worth 825 KB. */
-#define DELTA_STEP (DELTA_BLK / 4)         /* base index stride */
+/* Every byte, not every fourth. Indexing the base at a stride finds a match
+   only where an aligned block coincides, so a stride of s needs a run of
+   BLK + s - 1 bytes to guarantee a hit; at stride 1 the block size itself is
+   the minimum, which is what git does.
+ *
+ * This was 4 for a long time, because the index was being rebuilt for every
+ * (base, target) pair and a finer stride was unaffordable. Once the index is
+ * built once per base and reused across the window, the finer stride is not
+ * merely affordable but *faster*, since better matches leave fewer literal
+ * bytes to encode and deflate:
+ *
+ *      stride   pack body        time
+ *           4   1,640,221 B      3.79 s
+ *           2   1,477,532 B      2.78 s
+ *           1   1,380,006 B      2.74 s      <- and git is 1,484,589 B
+ *
+ * A parameter tuned around a defect stops being right when the defect is
+ * fixed. Stride 4 was costing 19% of the pack to save time it no longer saved. */
+#ifndef DELTA_STEP
+#define DELTA_STEP 1                       /* base index stride */
+#endif
 #endif
 
 static void dvarint(unsigned char **p, size_t v) {
@@ -1724,33 +1748,51 @@ static unsigned blk_hash(const unsigned char *p) {
     return h;
 }
 
-unsigned char *delta_create(const unsigned char *base, size_t blen,
-                            const unsigned char *tgt, size_t tlen, size_t *dlen) {
-    if (blen < DELTA_BLK || tlen < DELTA_BLK) return 0;
-    if (blen > 0xFFFFFFFFu) return 0;          /* copy offsets are 4 bytes */
+/* The block index over a base, built once and reused.
+ *
+ * It used to be built inside delta_create, which meant that offering an object
+ * to a window of W candidate bases rebuilt all W indexes for every target:
+ * O(N * W * |base|) where O(N * |base|) is enough. With W = 32 that is thirty
+ * two times the necessary work, and it was the whole of the gap against
+ * `git gc`, which builds a base's index once and slides it across every target
+ * that sees it. */
+typedef struct delta_index_s { size_t *head, *next, nslots, nblk, blen; } delta_index;
 
-    /* Index every DELTA_STEP-aligned block of the base, chained rather than
-       open-addressed. Real objects are full of repeated blocks -- a Mach-O
-       binary is largely runs of zeros -- and with linear probing those all
-       land in one cluster, which makes both insert and lookup walk it end to
-       end. Chaining keeps insert at O(1), and the DELTA_CAND cap keeps lookup
-       from ever walking a long chain: past the first handful of candidates a
-       better match is not worth the scan. */
-    size_t nblk = (blen - DELTA_BLK) / DELTA_STEP + 1;
-    size_t nslots = 1; while (nslots < nblk * 2 + 16) nslots <<= 1;
-    size_t *head = xmalloc(nslots * sizeof *head);
-    size_t *next = xmalloc(nblk * sizeof *next);
-    for (size_t i = 0; i < nslots; i++) head[i] = (size_t)-1;
-    for (size_t k = 0; k < nblk; k++) {
-        size_t j = blk_hash(base + k * DELTA_STEP) & (nslots - 1);
-        next[k] = head[j]; head[j] = k;
+void delta_index_free(delta_index *ix) {
+    if (!ix) return;
+    free(ix->head); free(ix->next); free(ix);
+}
+
+delta_index *delta_index_build(const unsigned char *base, size_t blen) {
+    if (blen < DELTA_BLK || blen > 0xFFFFFFFFu) return 0;
+    delta_index *ix = xmalloc(sizeof *ix);
+    ix->blen = blen;
+    ix->nblk = (blen - DELTA_BLK) / DELTA_STEP + 1;
+    ix->nslots = 1; while (ix->nslots < ix->nblk * 2 + 16) ix->nslots <<= 1;
+    ix->head = xmalloc(ix->nslots * sizeof *ix->head);
+    ix->next = xmalloc(ix->nblk * sizeof *ix->next);
+    for (size_t i = 0; i < ix->nslots; i++) ix->head[i] = (size_t)-1;
+    /* Chained, not open-addressed. Real objects are full of repeated blocks --
+       a Mach-O binary is largely runs of zeros -- and with linear probing those
+       all land in one cluster that both insert and lookup walk end to end. */
+    for (size_t k = 0; k < ix->nblk; k++) {
+        size_t j = blk_hash(base + k * DELTA_STEP) & (ix->nslots - 1);
+        ix->next[k] = ix->head[j]; ix->head[j] = k;
     }
+    return ix;
+}
+
+unsigned char *delta_create_indexed(const delta_index *ix, const unsigned char *base,
+                                    size_t blen, const unsigned char *tgt,
+                                    size_t tlen, size_t *dlen) {
+    if (!ix || ix->blen != blen || tlen < DELTA_BLK) return 0;
 
     unsigned char *out = xmalloc(tlen + tlen / 8 + 64), *o = out;
     dvarint(&o, blen);
     dvarint(&o, tlen);
 
     const unsigned POW = rk_pow();
+    const size_t nslots = ix->nslots;
     size_t pos = 0, lit = 0;
     unsigned h = 0; int have = 0;              /* h is valid for [pos, pos+BLK) */
 
@@ -1766,8 +1808,8 @@ unsigned char *delta_create(const unsigned char *base, size_t blen,
             if (!have) { h = blk_hash(tgt + pos); have = 1; }
             size_t j = h & (nslots - 1);
             int tries = 0;
-            for (size_t k = head[j]; k != (size_t)-1 && tries < DELTA_CAND;
-                 k = next[k], tries++) {
+            for (size_t k = ix->head[j]; k != (size_t)-1 && tries < DELTA_CAND;
+                 k = ix->next[k], tries++) {
                 size_t b = k * DELTA_STEP;
                 if (memcmp(base + b, tgt + pos, DELTA_BLK)) continue;
                 size_t n = DELTA_BLK;                           /* extend forward */
@@ -1793,7 +1835,6 @@ unsigned char *delta_create(const unsigned char *base, size_t blen,
             }
             have = 0;                          /* window jumped; rehash */
         } else {
-            /* roll off tgt[pos], roll on tgt[pos+BLK] */
             if (have && pos + DELTA_BLK < tlen)
                 h = (h - tgt[pos] * POW) * RK_MUL + tgt[pos + DELTA_BLK];
             else
@@ -1803,10 +1844,19 @@ unsigned char *delta_create(const unsigned char *base, size_t blen,
     }
     FLUSH_LIT();
     #undef FLUSH_LIT
-    free(head); free(next);
     *dlen = (size_t)(o - out);
     if (*dlen >= tlen) { free(out); return 0; }      /* no saving; store whole */
     return out;
+}
+
+/* The one-shot form, for callers with a single pair to compare. */
+unsigned char *delta_create(const unsigned char *base, size_t blen,
+                            const unsigned char *tgt, size_t tlen, size_t *dlen) {
+    delta_index *ix = delta_index_build(base, blen);
+    if (!ix) return 0;
+    unsigned char *d = delta_create_indexed(ix, base, blen, tgt, tlen, dlen);
+    delta_index_free(ix);
+    return d;
 }
 
 unsigned char *delta_apply(const unsigned char *base, size_t blen,

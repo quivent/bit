@@ -179,9 +179,9 @@ Measured on three corpora, same content and same object count on both sides:
 
 | corpus | bit, no delta | bit | | git | |
 |---|---|---|---|---|---|
-| bit's source, 3 commits | 98,007 B | **42,893 B** | 2.28× | 46,167 B | 1.08× |
-| git-core binaries, 32 MB | 15,449,819 B | **6,615,889 B** | 2.34× | 6,990,789 B | 1.06× |
-| `/dev/urandom` | 329,440 B | 329,440 B | 1.00× | 329,366 B | 1.00× |
+| bit's source, 3 commits | 112,443 B | **47,058 B** | 2.39× | 51,352 B | 1.09× |
+| git-core binaries, 32 MB | 15,449,698 B | **6,417,720 B** | 2.41× | 6,990,789 B | 1.09× |
+| `/dev/urandom` | 329,035 B | 329,035 B | 1.00× | 329,369 B | 1.00× |
 
 The third row is the important one. Random bytes have nothing to delta against,
 and every fixture in the benchmark suite was random bytes — which is why this
@@ -189,26 +189,38 @@ feature was measured as worthless for as long as it was missing.
 
 Three parameters decide the result, and only one of them mattered:
 
-| | binaries |
-|---|---|
-| block 16, stride 16 | 7,442,104 B |
-| block 16, stride 8 | 6,935,572 B |
-| block 16, stride 4 | 6,615,889 B |
-| window 32 → 8 | no change |
-| chain depth 50 → 4 | no change |
+| | 8,850-object repository | time |
+|---|---|---|
+| base indexed every 4 bytes | 1,640,221 B | 3.79 s |
+| base indexed every 2 bytes | 1,477,532 B | 2.78 s |
+| base indexed every byte | **1,380,006 B** | 2.74 s |
+| window 32 → 8 | no change | |
+| chain depth 50 → 4 | no change | |
 
-The stride is how often the base is indexed. At a stride equal to the block, a
-match is found only where 16 *aligned* bytes line up, which needs a run of 31 to
-guarantee; at a stride of 4 a run of 19 suffices. Shared code sits at unaligned
-offsets, so alignment was discarding most of the matches actually present. The
-window and depth caps never bound anything.
+Only the stride. A stride of *s* needs a run of `block + s − 1` bytes to
+guarantee a hit, so at stride 1 the block size itself is the minimum — which is
+what git does. The stride sat at 4 for a long time because the block index was
+being rebuilt for every (base, target) pair, and a finer stride was
+unaffordable. Once the index is built once per base and reused across the whole
+window, the finer stride is not merely affordable but **faster**: better matches
+leave fewer literal bytes to encode and deflate. A parameter tuned around a
+defect stopped being right when the defect was fixed, and it was costing 19% of
+the pack to save time it no longer saved.
 
-The table is hashed with chaining, not open addressing. Real objects contain
-long runs of identical blocks — a Mach-O binary is largely zeros — and under
-linear probing those collapse into one cluster that both insert and lookup walk
-end to end. That was quadratic: switching to chaining took packing the 32 MB
-corpus from 16.8 s to 3.1 s, and the rolling hash added before it turned out to
-be worth almost nothing by comparison.
+The candidate window and the chain-depth cap, the two parameters that look like
+the important ones, never bound anything on any corpus measured.
+
+The block index is chained, not open-addressed. Real objects contain long runs
+of identical blocks — a Mach-O binary is largely zeros — and under linear
+probing those collapse into one cluster that both insert and lookup walk end to
+end. That was quadratic: chaining took packing the 32 MB corpus from 16.8 s to
+3.1 s, and a rolling hash added first, on the theory that the scan was the cost,
+was worth 0.8 s of the 16.8.
+
+Packing is still **4.6× slower than git** (3.6 s against 0.78 s on 8,850
+objects). git orders candidates by (type, path hash, size) where bit orders by
+(type, size), so git finds a better base in fewer comparisons. That ordering is
+the remaining gap and it has not been closed.
 
 Reconstruction is verified by the digest that named the object, so a delta that
 rebuilds the wrong bytes fails the lookup instead of returning them.
