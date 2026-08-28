@@ -1,6 +1,7 @@
 #include "bit.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <zlib.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
@@ -171,10 +173,19 @@ int repo_find(char *out, size_t cap) {
         *slash = 0;
     }
 }
+/* Cached. repo_find walks up the tree calling stat at each level, and the
+   answer cannot change inside one command, but object_read called this once
+   per object -- so reading n objects walked the directory tree n times. */
 int repo_git_dir(char *out, size_t cap) {
-    char root[1024];
-    if (repo_find(root, sizeof root) < 0) return -1;
-    snprintf(out, cap, "%s/.git", root);
+    static char cached[1200];
+    static int state;                            /* 0 unknown, 1 found, -1 not */
+    if (state == 0) {
+        char root[1024];
+        if (repo_find(root, sizeof root) < 0) state = -1;
+        else { snprintf(cached, sizeof cached, "%s/.git", root); state = 1; }
+    }
+    if (state < 0) return -1;
+    snprintf(out, cap, "%s", cached);
     return 0;
 }
 
@@ -526,6 +537,57 @@ void delta_index_free(struct delta_index_s *ix);
 unsigned char *delta_create_indexed(const struct delta_index_s *ix,
                                     const unsigned char *base, size_t blen,
                                     const unsigned char *tgt, size_t tlen, size_t *dlen);
+unsigned char *delta_create_max(const struct delta_index_s *ix,
+                                const unsigned char *base, size_t blen,
+                                const unsigned char *tgt, size_t tlen,
+                                size_t max, size_t *dlen);
+
+/* A pack is mapped, not read.
+ *
+ * Every lookup used to slurp the entire pack file to reach one object: a
+ * malloc, a full read, and a free, per object, so reading a 200-byte blob out
+ * of a gigabyte pack read a gigabyte. The bucket directory made the *location*
+ * free to compute and then the read threw that away. Mapped once per process
+ * and cached by path, a lookup touches only the pages the bucket walk lands on.
+ *
+ * The cache is process-lifetime, which is right for one-shot commands. The one
+ * writer, pack_write, renames a new pack into place and drops the entry so a
+ * later read in the same process does not see the file it replaced. */
+#define MAPCACHE 4
+static struct { char path[1400]; unsigned char *base; size_t len; } mapc[MAPCACHE];
+static int mapc_n;
+
+static const unsigned char *map_file(const char *path, size_t *len) {
+#ifdef PACK_SLURP
+    return (const unsigned char *)slurp(path, len);   /* the old whole-file read */
+#endif
+    for (int i = 0; i < mapc_n; i++)
+        if (!strcmp(mapc[i].path, path)) { *len = mapc[i].len; return mapc[i].base; }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || st.st_size <= 0) { close(fd); return 0; }
+    void *p = mmap(0, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);                                  /* the mapping keeps it alive */
+    if (p == MAP_FAILED) return 0;
+    *len = (size_t)st.st_size;
+    if (mapc_n < MAPCACHE) {
+        snprintf(mapc[mapc_n].path, sizeof mapc[mapc_n].path, "%s", path);
+        mapc[mapc_n].base = p; mapc[mapc_n].len = *len; mapc_n++;
+    }
+    return p;
+}
+
+static void bcache_drop(void);
+static void map_forget(const char *path) {
+    bcache_drop();                              /* offsets refer to the old file */
+    for (int i = 0; i < mapc_n; i++)
+        if (!strcmp(mapc[i].path, path)) {
+            munmap(mapc[i].base, mapc[i].len);
+            mapc[i] = mapc[--mapc_n];
+            return;
+        }
+}
 
 /* ---- pack ---- */
 
@@ -646,13 +708,20 @@ static int raw_inflate(const unsigned char *in, size_t ilen,
     return ok ? 0 : -1;
 }
 
+/* Names only. This used to mkdir the directory as a side effect, which put a
+   filesystem mutation in the path of every object read: a lookup spent more
+   time creating a directory that already existed than it did reconstructing
+   the object it was asked for. Only the writer needs the directory to exist,
+   so only the writer creates it. */
 static void pack_paths_in(const char *git, char *pack, size_t pc, char *idx, size_t ic) {
     // Not .git/objects/pack: this is not git's pack format, and git tries to
     // parse anything it finds there, reporting "non-monotonic index".
+    snprintf(pack, pc, "%s/bitpack/bit.pack", git);
+    snprintf(idx,  ic, "%s/bitpack/bit.dir",  git);
+}
+static void pack_dir_create(const char *git) {
     char dir[1200]; snprintf(dir, sizeof dir, "%s/bitpack", git);
     mkdir(dir, 0755);
-    snprintf(pack, pc, "%s/bit.pack", dir);
-    snprintf(idx,  ic, "%s/bit.dir",  dir);
 }
 static void pack_paths(char *pack, size_t pc, char *idx, size_t ic) {
     char git[1024];
@@ -760,6 +829,7 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
     char git[1024]; if (repo_git_dir(git, sizeof git) < 0) return -1;
     char objdir[1200]; snprintf(objdir, sizeof objdir, "%s/objects", git);
     char packp[1300], dirp[1300];
+    pack_dir_create(git);                        /* the writer, and only it */
     pack_paths(packp, sizeof packp, dirp, sizeof dirp);
 
     /* Pass 1: everything that must end up in the new pack -- the loose store
@@ -801,9 +871,9 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
         closedir(d);
     }
 
-    size_t oplen = 0; unsigned char *oldpk = (unsigned char *)slurp(packp, &oplen);
+    size_t oplen = 0; const unsigned char *oldpk = map_file(packp, &oplen);
     if (oldpk && oplen >= 12 && !memcmp(oldpk, PACK_MAGIC, 8)) {
-        size_t dlen; unsigned char *od = (unsigned char *)slurp(dirp, &dlen);
+        size_t dlen; const unsigned char *od = map_file(dirp, &dlen);
         dirview v;
         if (od && dir_open(od, dlen, &v) == 0) {
             size_t off = 12, endall = dir_at(&v, v.nb);
@@ -821,9 +891,7 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
                 off = body + zl;
             }
         }
-        free(od);
     }
-    free(oldpk);
     oidset_free(&seen);
     #undef ADD_META
 
@@ -855,11 +923,24 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
 
         unsigned char *bestz = 0; size_t bestzlen = 0, bestraw = 0;
         long bestbase = -1; int bestdepth = 0, beststored = 0;
-        for (int wi = 0; wi < nwin; wi++) {
+        /* Newest first. Objects arrive in size order, so the most recently
+           seen candidates are the closest in size and the likeliest to give a
+           small delta -- which sets a tight ceiling early and lets every
+           candidate after it be abandoned sooner. */
+        /* The ceiling bounds the *raw* delta, so it starts at the object's raw
+           length -- not at zfull, which is the deflated whole. Comparing a raw
+           delta against a deflated size rejected deltas that would have won
+           easily once compressed: on bit's own source it threw away half of
+           them and cost 12% of the pack. The selection among survivors is
+           still decided on deflated size. */
+        size_t ceiling = len;
+        for (int k = 0; k < nwin; k++) {
+            int wi = (wnext - 1 - k + DELTA_WIN * 2) % DELTA_WIN;
+            if (wi >= nwin && nwin < DELTA_WIN) continue;
             if (win[wi].tc != tc || win[wi].depth >= DELTA_DEPTH || !win[wi].ix) continue;
             size_t dl;
-            unsigned char *dd = delta_create_indexed(win[wi].ix, win[wi].data,
-                                                     win[wi].len, data, len, &dl);
+            unsigned char *dd = delta_create_max(win[wi].ix, win[wi].data,
+                                                 win[wi].len, data, len, ceiling, &dl);
             if (!dd) continue;
             size_t zd = compressBound((uLong)dl) + 64;
             unsigned char *zz = xmalloc(zd);
@@ -873,6 +954,7 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
                 bestz = zz; bestzlen = zd; bestraw = dl;
                 bestbase = win[wi].rec; bestdepth = win[wi].depth + 1;
                 beststored = dstored;
+                if (dl < ceiling) ceiling = dl;        /* tightens as it improves */
             } else free(zz);
         }
 
@@ -1000,6 +1082,7 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
     free(bstart);
     if (xerr) { unlink(tpackp); unlink(tdirp); return -1; }
 
+    map_forget(packp); map_forget(dirp);        /* the mapped files are gone */
     if (rename(tpackp, packp) != 0) { unlink(tpackp); unlink(tdirp); return -1; }
     if (rename(tdirp, dirp) != 0) return -1;
 
@@ -1012,10 +1095,10 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
 int pack_stats(int *nobj, int *ndelta_out) {
     char packp[1300], dirp[1300];
     pack_paths(packp, sizeof packp, dirp, sizeof dirp);
-    size_t plen; unsigned char *pk = (unsigned char *)slurp(packp, &plen);
-    size_t dlen; unsigned char *dd = (unsigned char *)slurp(dirp, &dlen);
+    size_t plen; const unsigned char *pk = map_file(packp, &plen);
+    size_t dlen; const unsigned char *dd = map_file(dirp, &dlen);
     dirview v;
-    if (!pk || dir_open(dd, dlen, &v) < 0) { free(pk); free(dd); return -1; }
+    if (!pk || dir_open(dd, dlen, &v) < 0) return -1;
     size_t off = 12, endall = dir_at(&v, v.nb);
     int nd = 0;
     while (off < endall && off < plen) {
@@ -1027,8 +1110,50 @@ int pack_stats(int *nobj, int *ndelta_out) {
     }
     if (nobj) *nobj = (int)v.n;
     if (ndelta_out) *ndelta_out = nd;
-    free(pk); free(dd);
     return 0;
+}
+
+/* Resolved delta bases, remembered for the life of the process.
+ *
+ * Reconstructing a delta means reconstructing its base, which may itself be a
+ * delta: a chain of depth d costs d inflations. Without this, every lookup
+ * walked its whole chain from the bottom, and a checkout of a repository where
+ * 99% of objects are deltas re-resolved thousands of heavily overlapping
+ * chains -- the same base rebuilt once per object that depends on it. git
+ * keeps a delta base cache for exactly this reason.
+ *
+ * Keyed by pack offset, which is what the chain actually references, and
+ * bounded by bytes rather than entries so one enormous object cannot evict
+ * everything. Entries hand out copies; the cache owns its own. */
+#define BASECACHE_SLOTS 1024
+#define BASECACHE_BYTES (64u << 20)
+typedef struct { size_t off; int tc; unsigned char *data; size_t len; } bcent;
+static bcent bcache[BASECACHE_SLOTS];
+static size_t bcache_bytes;
+
+static void bcache_drop(void) {
+    for (int i = 0; i < BASECACHE_SLOTS; i++) {
+        free(bcache[i].data); bcache[i].data = 0; bcache[i].off = 0;
+    }
+    bcache_bytes = 0;
+}
+static unsigned char *bcache_get(size_t off, int *tc, size_t *len) {
+    bcent *e = &bcache[(off * 2654435761u >> 4) & (BASECACHE_SLOTS - 1)];
+    if (!e->data || e->off != off) return 0;
+    unsigned char *copy = xmalloc(e->len + 1);
+    memcpy(copy, e->data, e->len); copy[e->len] = 0;
+    *tc = e->tc; *len = e->len;
+    return copy;
+}
+static void bcache_put(size_t off, int tc, const unsigned char *data, size_t len) {
+    if (len > BASECACHE_BYTES / 8) return;             /* never let one entry rule */
+    if (bcache_bytes + len > BASECACHE_BYTES) bcache_drop();
+    bcent *e = &bcache[(off * 2654435761u >> 4) & (BASECACHE_SLOTS - 1)];
+    if (e->data) { bcache_bytes -= e->len; free(e->data); }
+    e->data = xmalloc(len + 1);
+    memcpy(e->data, data, len); e->data[len] = 0;
+    e->off = off; e->tc = tc; e->len = len;
+    bcache_bytes += len;
 }
 
 /* Reconstruct the object at `off`, following the base chain if it is a delta.
@@ -1067,7 +1192,11 @@ static unsigned char *pack_at(const unsigned char *pk, size_t plen, size_t off,
     } else if (raw_inflate(p, (size_t)zlen, dz, (size_t)ulen) != 0) { free(dz); return 0; }
 
     int btc; size_t blen;
-    unsigned char *base = pack_at(pk, plen, boff, &btc, &blen, depth + 1);
+    unsigned char *base = bcache_get(boff, &btc, &blen);
+    if (!base) {
+        base = pack_at(pk, plen, boff, &btc, &blen, depth + 1);
+        if (base) bcache_put(boff, btc, base, blen);
+    }
     if (!base) { free(dz); return 0; }
 
     size_t olen;
@@ -1087,17 +1216,16 @@ void *pack_read_in(const char *gitdir, const oid *o, char *type_out,
                    size_t type_cap, size_t *len_out) {
     char packp[1400], dirp[1400];
     pack_paths_in(gitdir, packp, sizeof packp, dirp, sizeof dirp);
-    size_t dlen; unsigned char *dd = (unsigned char *)slurp(dirp, &dlen);
+    size_t dlen; const unsigned char *dd = map_file(dirp, &dlen);
     dirview v;
-    if (dir_open(dd, dlen, &v) < 0) { free(dd); return 0; }
+    if (dir_open(dd, dlen, &v) < 0) return 0;
     uint32_t b = oid_bucket(o, v.bits);
     size_t off = dir_at(&v, b), stop = dir_at(&v, b + 1);
-    free(dd);
     if (stop <= off) return 0;
 
-    size_t plen; unsigned char *pk = (unsigned char *)slurp(packp, &plen);
+    size_t plen; const unsigned char *pk = map_file(packp, &plen);
     if (!pk) return 0;
-    if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) { free(pk); return 0; }
+    if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) return 0;
     if (stop > plen) stop = plen;
 
     while (off < stop) {
@@ -1110,7 +1238,6 @@ void *pack_read_in(const char *gitdir, const oid *o, char *type_out,
             if (out) {
                 oid check; object_write(type_name(rtc), out, rlen, 0, &check);
                 if (oid_eq(&check, o)) {
-                    free(pk);
                     if (type_out) snprintf(type_out, type_cap, "%s", type_name(rtc));
                     if (len_out) *len_out = rlen;
                     return out;
@@ -1120,24 +1247,23 @@ void *pack_read_in(const char *gitdir, const oid *o, char *type_out,
         }
         off = body + zl;
     }
-    free(pk);
     return 0;
 }
 
 int pack_unpack(int *n_out) {
     char packp[1300], dirp[1300];
     pack_paths(packp, sizeof packp, dirp, sizeof dirp);
-    size_t plen; unsigned char *pk = (unsigned char *)slurp(packp, &plen);
+    size_t plen; const unsigned char *pk = map_file(packp, &plen);
     if (!pk) return -1;
     if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) {
         if (plen >= 8 && !memcmp(pk, "BITPACK", 7))
             fprintf(stderr, "bit: this pack is an earlier format (%.8s); this "
                             "build writes %s.\n", pk, PACK_MAGIC);
-        free(pk); return -1;
+        return -1;
     }
-    size_t dlen; unsigned char *dd = (unsigned char *)slurp(dirp, &dlen);
+    size_t dlen; const unsigned char *dd = map_file(dirp, &dlen);
     dirview v;
-    if (dir_open(dd, dlen, &v) < 0) { free(pk); free(dd); return -1; }
+    if (dir_open(dd, dlen, &v) < 0) return -1;
 
     /* Every object is checked against the fingerprint recorded with it before
        it is written. Unpacking is the one path that turns pack bytes into
@@ -1162,7 +1288,6 @@ int pack_unpack(int *n_out) {
         done++;
         off = body + zl;
     }
-    free(pk); free(dd);
     if (n_out) *n_out = done;
     if (bad) {
         fprintf(stderr, "bit: %d objects in the pack are corrupt and were not "
@@ -1782,10 +1907,16 @@ delta_index *delta_index_build(const unsigned char *base, size_t blen) {
     return ix;
 }
 
-unsigned char *delta_create_indexed(const delta_index *ix, const unsigned char *base,
-                                    size_t blen, const unsigned char *tgt,
-                                    size_t tlen, size_t *dlen) {
+/* `max` is a ceiling: the best delta found so far, or the cost of storing the
+   object whole. Most candidates in a window produce a delta nobody will use,
+   and encoding one to the last byte before discarding it is the bulk of what
+   packing spends its time on. Abandoning a candidate the moment it exceeds the
+   ceiling costs a comparison per instruction and skips the rest. */
+unsigned char *delta_create_max(const delta_index *ix, const unsigned char *base,
+                                size_t blen, const unsigned char *tgt,
+                                size_t tlen, size_t max, size_t *dlen) {
     if (!ix || ix->blen != blen || tlen < DELTA_BLK) return 0;
+    if (max > tlen) max = tlen;
 
     unsigned char *out = xmalloc(tlen + tlen / 8 + 64), *o = out;
     dvarint(&o, blen);
@@ -1793,6 +1924,7 @@ unsigned char *delta_create_indexed(const delta_index *ix, const unsigned char *
 
     const unsigned POW = rk_pow();
     const size_t nslots = ix->nslots;
+    const unsigned char *ceiling = out + max;
     size_t pos = 0, lit = 0;
     unsigned h = 0; int have = 0;              /* h is valid for [pos, pos+BLK) */
 
@@ -1803,6 +1935,7 @@ unsigned char *delta_create_indexed(const delta_index *ix, const unsigned char *
     } while (0)
 
     while (pos < tlen) {
+        if (o + lit >= ceiling) { free(out); return 0; }   /* already too big */
         size_t moff = 0, mlen = 0;
         if (pos + DELTA_BLK <= tlen) {
             if (!have) { h = blk_hash(tgt + pos); have = 1; }
@@ -1845,8 +1978,14 @@ unsigned char *delta_create_indexed(const delta_index *ix, const unsigned char *
     FLUSH_LIT();
     #undef FLUSH_LIT
     *dlen = (size_t)(o - out);
-    if (*dlen >= tlen) { free(out); return 0; }      /* no saving; store whole */
+    if (*dlen >= max) { free(out); return 0; }       /* no saving; store whole */
     return out;
+}
+
+unsigned char *delta_create_indexed(const delta_index *ix, const unsigned char *base,
+                                    size_t blen, const unsigned char *tgt,
+                                    size_t tlen, size_t *dlen) {
+    return delta_create_max(ix, base, blen, tgt, tlen, tlen, dlen);
 }
 
 /* The one-shot form, for callers with a single pair to compare. */

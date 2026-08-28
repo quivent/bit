@@ -28,8 +28,32 @@ static int collect(const char *path, uint32_t mode, const oid *id, void *ctx) {
     h->n++;
     return 0;
 }
+static int head_cmp(const void *a, const void *b) {
+    return strcmp(((const head_ent *)a)->path, ((const head_ent *)b)->path);
+}
+/* Binary search, over a set sorted once. This was a linear scan called once
+   per index entry, so status was O(entries * head entries): at eight thousand
+   files that is sixty-four million string comparisons, and it was most of what
+   status spent its time doing. */
 static const head_ent *head_find(const head_set *h, const char *p) {
-    for (size_t i = 0; i < h->n; i++) if (!strcmp(h->e[i].path, p)) return &h->e[i];
+    long lo = 0, hi = (long)h->n - 1;
+    while (lo <= hi) {
+        long mid = (lo + hi) / 2;
+        int c = strcmp(h->e[mid].path, p);
+        if (c == 0) return &h->e[mid];
+        if (c < 0) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
+/* The index is kept sorted by path, so the same applies to it. */
+static int index_has(const bit_index *ix, const char *p) {
+    long lo = 0, hi = (long)ix->n - 1;
+    while (lo <= hi) {
+        long mid = (lo + hi) / 2;
+        int c = strcmp(ix->e[mid].path, p);
+        if (c == 0) return 1;
+        if (c < 0) lo = mid + 1; else hi = mid - 1;
+    }
     return 0;
 }
 
@@ -51,9 +75,7 @@ static void scan(const char *root, const char *rel, const bit_index *ix) {
         struct stat st;
         if (stat(cfull, &st) < 0) continue;
         if (S_ISDIR(st.st_mode)) { scan(root, child, ix); continue; }
-        int known = 0;
-        for (size_t i = 0; i < ix->n; i++) if (!strcmp(ix->e[i].path, child)) { known = 1; break; }
-        if (!known) printf("?? %s\n", child);
+        if (!index_has(ix, child)) printf("?? %s\n", child);
     }
     closedir(d);
 }
@@ -79,6 +101,8 @@ int cmd_main(int argc, char **argv) {
         }
     }
 
+    qsort(h.e, h.n, sizeof *h.e, head_cmp);              /* sorted once, searched n times */
+
     for (size_t i = 0; i < ix.n; i++) {
         const bit_entry *e = &ix.e[i];
         const head_ent *he = head_find(&h, e->path);
@@ -97,11 +121,8 @@ int cmd_main(int argc, char **argv) {
         if (staged != ' ' || work != ' ') printf("%c%c %s\n", staged, work, e->path);
     }
 
-    for (size_t i = 0; i < h.n; i++) {                    /* in HEAD, gone from index */
-        int in_ix = 0;
-        for (size_t j = 0; j < ix.n; j++) if (!strcmp(ix.e[j].path, h.e[i].path)) { in_ix = 1; break; }
-        if (!in_ix) printf("D  %s\n", h.e[i].path);
-    }
+    for (size_t i = 0; i < h.n; i++)                     /* in HEAD, gone from index */
+        if (!index_has(&ix, h.e[i].path)) printf("D  %s\n", h.e[i].path);
 
     scan(root, "", &ix);
     free(h.e); index_free(&ix);
