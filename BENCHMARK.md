@@ -110,10 +110,57 @@ Three of the four optimisations above are simply *using* it. The measurement was
 right and the conclusion was wrong: a field that is constant is not thereby
 useless.
 
+## Packing, on content that is not random
+
+Every fixture above is `/dev/urandom`, which is the right choice for timing the
+working-tree arms and the wrong one for measuring a pack: random bytes have
+nothing to delta against, so a pack of them measures compression and nothing
+else. That fixture is the reason delta encoding read as worthless for as long as
+bit did not have it.
+
+`test/delta.sh` measures it on content that is not random. Same content, same
+object count, both sides packed:
+
+| corpus | bit, delta off | bit | | git | bit/git |
+|---|---|---|---|---|---|
+| bit's own source, 3 commits of small edits | 98,007 B | **42,893 B** | 2.28× | 46,167 B | 1.076× |
+| git-core binaries, 22 files, 32 MB | 15,449,819 B | **6,615,889 B** | 2.34× | 6,990,789 B | 1.057× |
+| 40 × 8 KB of `/dev/urandom` | 329,440 B | 329,440 B | 1.00× | 329,366 B | 1.000× |
+
+The third row is the control. It confirms both that delta finds nothing in
+random bytes and that it costs nothing to try.
+
+The cost is time. Packing the 32 MB corpus takes bit 4.4 s against
+`git gc --aggressive` at 1.4 s — **3.3× slower** — because each of the 32
+candidate bases rebuilds a hash index of itself for every target object. That
+is `TASK-013`; building it once per base is the obvious fix and has not been
+done.
+
+### What actually moved the number
+
+| change | 32 MB corpus |
+|---|---|
+| base indexed every 16 B (= block size) | 7,442,104 B |
+| base indexed every 8 B | 6,935,572 B |
+| base indexed every 4 B | **6,615,889 B** |
+| block size 32 instead of 16 | 7,448,634 B |
+| candidate window 32 → 8 | no change |
+| chain depth 50 → 4 | no change |
+
+Only the stride. The window and depth caps, the two parameters that look like
+the important ones, never bound anything on this corpus.
+
+Separately, and not visible in output size at all: the block index originally
+used open addressing. Objects contain long runs of identical blocks — a Mach-O
+binary is largely zeros — and those all cluster into one probe chain that both
+insert and lookup walk end to end. Switching to chaining took the same pack from
+16.8 s to 3.1 s. A rolling hash added just before that, on the theory that the
+scan was the cost, was worth 0.8 s of the 16.8.
+
 ## Caveats
 
-- Random-content blobs. Delta compression, which git's pack does and ours does
-  not, is worth nothing here and would matter on real source.
+- The working-tree arms use random-content blobs, which is why packing is
+  measured separately above.
 - `git commit` runs with `--allow-empty` in the commit arm, so it does slightly
   less work than bit's.
 - git is doing more than bit in several arms: it consults `.gitignore`, supports

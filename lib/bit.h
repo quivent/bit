@@ -104,6 +104,7 @@ char *slurp(const char *path, size_t *len);
  */
 int  pack_write(int *n_out, size_t *pack_out, size_t *idx_out);
 void *pack_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out);
+int  pack_stats(int *nobj, int *ndelta);
 
 /* --- trees ---
  * Walk a tree recursively. cb receives the path relative to the tree root, the
@@ -162,3 +163,16 @@ int resolve_gitdir(const char *path, char *out, size_t cap);
  * FETCH_HEAD, and report the remote branch tip. */
 int do_fetch(const char *remote, oid *head_out, char *branch_out, size_t bcap,
              int *reach_out, int *sent_out);
+
+/* --- delta ---
+ * Store an object as instructions to reconstruct it from another. The
+ * instruction stream is git's: a byte with the high bit set is a copy from the
+ * base, with the low bits selecting which offset and size bytes follow; a byte
+ * with the high bit clear is a literal insert of that many bytes.
+ *
+ * Two near-identical objects then cost one full copy plus a handful of
+ * instructions, instead of two full copies. */
+unsigned char *delta_create(const unsigned char *base, size_t blen,
+                            const unsigned char *tgt, size_t tlen, size_t *dlen);
+unsigned char *delta_apply(const unsigned char *base, size_t blen,
+                           const unsigned char *d, size_t dlen, size_t *olen);

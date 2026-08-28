@@ -504,10 +504,18 @@ static void pack_paths(char *pack, size_t pc, char *idx, size_t ic) {
 static void put_varint(FILE *f, uint64_t v) {
     do { unsigned char b = v & 0x7f; v >>= 7; if (v) b |= 0x80; fputc(b, f); } while (v);
 }
-static uint64_t get_varint(const unsigned char **p) {
+/* Bounded, for the same reason dvarint_get is: a pack is a file, and a file
+   can be truncated or wrong. On a truncated or over-long encoding this parks
+   *p at `end` and sets *bad, which every caller checks before using the value. */
+static uint64_t get_varint(const unsigned char **p, const unsigned char *end, int *bad) {
     uint64_t v = 0; int shift = 0;
-    for (;;) { unsigned char b = *(*p)++; v |= (uint64_t)(b & 0x7f) << shift;
-               if (!(b & 0x80)) break; shift += 7; }
+    for (;;) {
+        if (*p >= end || shift > 63) { *p = end; *bad = 1; return 0; }
+        unsigned char b = *(*p)++;
+        v |= (uint64_t)(b & 0x7f) << shift;
+        if (!(b & 0x80)) break;
+        shift += 7;
+    }
     return v;
 }
 static int type_code(const char *t) {
@@ -522,23 +530,55 @@ static int idx_cmp(const void *a, const void *b) {
     return memcmp(((const idx_ent *)a)->id.b, ((const idx_ent *)b)->id.b, IDX_PREFIX);
 }
 
+/* --- pack, with delta ---
+ *
+ * Objects are written in (type, size-descending) order, which puts objects
+ * likely to resemble each other next to each other. Each one is then offered
+ * the last DELTA_WIN objects of its own type as a base: if the smallest delta
+ * compresses to less than the object itself does, the delta is what gets
+ * stored, along with the absolute pack offset of its base.
+ *
+ * A base is always written before anything that deltas against it, so
+ * resolution walks backwards through the file and terminates. Chains are
+ * capped at DELTA_DEPTH so a read is never more than that many applies. */
+
+#ifndef DELTA_WIN
+#define DELTA_WIN   32
+#endif
+#ifndef DELTA_DEPTH
+#define DELTA_DEPTH 50
+#endif
+#define TC_DELTA    7
+
+typedef struct { int tc; unsigned char *data; size_t len; uint32_t off; int depth; } win_t;
+
+typedef struct { oid id; int tc; size_t size; } meta_t;
+static int meta_cmp(const void *a, const void *b) {
+    const meta_t *x = a, *y = b;
+    if (x->tc != y->tc) return x->tc - y->tc;
+    if (x->size != y->size) return x->size < y->size ? 1 : -1;   /* large first */
+    return memcmp(x->id.b, y->id.b, OID_RAW);
+}
+
+/* varint into a buffer rather than a FILE, for measuring an entry before
+   committing to it */
+static size_t buf_varint(unsigned char *p, uint64_t v) {
+    size_t n = 0;
+    do { unsigned char b = v & 0x7f; v >>= 7; if (v) b |= 0x80; p[n++] = b; } while (v);
+    return n;
+}
+
 int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
     char git[1024]; if (repo_git_dir(git, sizeof git) < 0) return -1;
     char objdir[1200]; snprintf(objdir, sizeof objdir, "%s/objects", git);
 
-    idx_ent *ents = 0; size_t n = 0, cap = 0;
-    char packp[1300], idxp[1300];
-    pack_paths(packp, sizeof packp, idxp, sizeof idxp);
-    FILE *pf = fopen(packp, "wb");
-    if (!pf) return -1;
-    fwrite(PACK_MAGIC, 1, 8, pf);
-    uint32_t zero = 0; fwrite(&zero, 4, 1, pf);        /* count, patched at the end */
-
+    /* pass 1: what is there, and how big */
+    meta_t *m = 0; size_t n = 0, cap = 0;
     DIR *d = opendir(objdir);
-    if (!d) { fclose(pf); return -1; }
+    if (!d) return -1;
     struct dirent *de;
     while ((de = readdir(d))) {
-        if (strlen(de->d_name) != 2) continue;         /* only the 2-hex shards */
+        if (strlen(de->d_name) != 2) continue;
         char sub[1400]; snprintf(sub, sizeof sub, "%s/%s", objdir, de->d_name);
         DIR *s = opendir(sub); if (!s) continue;
         struct dirent *se;
@@ -550,24 +590,103 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
             char type[32]; size_t len;
             void *data = object_read(&o, type, sizeof type, &len);
             if (!data) continue;
-
-            if (n == cap) { cap = cap ? cap * 2 : 256; ents = xrealloc(ents, cap * sizeof *ents); }
-            ents[n].id = o;
-            ents[n].off = (uint32_t)ftell(pf);
+            if (n == cap) { cap = cap ? cap * 2 : 256; m = xrealloc(m, cap * sizeof *m); }
+            m[n].id = o; m[n].tc = type_code(type); m[n].size = len;
             n++;
-
-            uLongf zcap = compressBound((uLong)len);
-            unsigned char *z = xmalloc(zcap);
-            compress2(z, &zcap, data, (uLong)len, Z_DEFAULT_COMPRESSION);
-            fputc(type_code(type), pf);
-            put_varint(pf, len);
-            put_varint(pf, zcap);
-            fwrite(z, 1, zcap, pf);
-            free(z); free(data);
+            free(data);
         }
         closedir(s);
     }
     closedir(d);
+    qsort(m, n, sizeof *m, meta_cmp);
+
+    /* pass 2: write, deltaing against the window */
+    idx_ent *ents = xmalloc((n ? n : 1) * sizeof *ents);
+    char packp[1300], idxp[1300];
+    pack_paths(packp, sizeof packp, idxp, sizeof idxp);
+    FILE *pf = fopen(packp, "wb");
+    if (!pf) { free(m); free(ents); return -1; }
+    fwrite(PACK_MAGIC, 1, 8, pf);
+    uint32_t zero = 0; fwrite(&zero, 4, 1, pf);
+
+    win_t win[DELTA_WIN]; int nwin = 0, wnext = 0;
+    memset(win, 0, sizeof win);
+    size_t ndelta = 0, delta_saved = 0;
+
+    size_t w = 0;                       /* objects actually written */
+    for (size_t i = 0; i < n; i++) {
+        char type[32]; size_t len;
+        unsigned char *data = object_read(&m[i].id, type, sizeof type, &len);
+        if (!data) continue;            /* not counted: see w, not i, below */
+        int tc = type_code(type);
+
+        uLongf zfull = compressBound((uLong)len);
+        unsigned char *zf = xmalloc(zfull);
+        compress2(zf, &zfull, data, (uLong)len, Z_DEFAULT_COMPRESSION);
+
+        /* smallest delta the window can offer */
+        unsigned char *bestz = 0; size_t bestzlen = 0, bestraw = 0;
+        uint32_t bestoff = 0; int bestdepth = 0;
+        for (int w = 0; w < nwin; w++) {
+            if (win[w].tc != tc || win[w].depth >= DELTA_DEPTH) continue;
+            size_t dl;
+            unsigned char *dd = delta_create(win[w].data, win[w].len, data, len, &dl);
+            if (!dd) continue;
+            uLongf zd = compressBound((uLong)dl);
+            unsigned char *zz = xmalloc(zd);
+            compress2(zz, &zd, dd, (uLong)dl, Z_DEFAULT_COMPRESSION);
+            free(dd);
+            if (!bestz || zd < bestzlen) {
+                free(bestz);
+                bestz = zz; bestzlen = zd; bestraw = dl;
+                bestoff = win[w].off; bestdepth = win[w].depth + 1;
+            } else free(zz);
+        }
+
+        uint32_t off = (uint32_t)ftell(pf);
+        int stored_delta = 0;
+        if (bestz) {
+            /* compare whole entries, header included -- a delta entry carries a
+               base offset the full entry does not */
+            unsigned char hd[32];
+            size_t doverhead = 1 + buf_varint(hd, bestoff) + buf_varint(hd, bestraw)
+                                 + buf_varint(hd, bestzlen);
+            size_t foverhead = 1 + buf_varint(hd, len) + buf_varint(hd, zfull);
+            if (doverhead + bestzlen < foverhead + zfull) stored_delta = 1;
+        }
+
+        if (stored_delta) {
+            fputc(TC_DELTA, pf);
+            put_varint(pf, bestoff);
+            put_varint(pf, bestraw);
+            put_varint(pf, bestzlen);
+            fwrite(bestz, 1, bestzlen, pf);
+            ndelta++;
+            delta_saved += zfull - bestzlen;
+        } else {
+            fputc(tc, pf);
+            put_varint(pf, len);
+            put_varint(pf, zfull);
+            fwrite(zf, 1, zfull, pf);
+            bestdepth = 0;
+        }
+        free(bestz); free(zf);
+
+        ents[w].id = m[i].id;
+        ents[w].off = off;
+        w++;
+
+        /* into the window; the slot it displaces is freed */
+        free(win[wnext].data);
+        win[wnext].tc = tc; win[wnext].data = data; win[wnext].len = len;
+        win[wnext].off = off; win[wnext].depth = bestdepth;
+        wnext = (wnext + 1) % DELTA_WIN;
+        if (nwin < DELTA_WIN) nwin++;
+    }
+    for (int w = 0; w < nwin; w++) free(win[w].data);
+    free(m);
+
+    n = w;                              /* the header counts what was written */
     fseek(pf, 8, SEEK_SET); uint32_t cnt = (uint32_t)n; fwrite(&cnt, 4, 1, pf);
     fseek(pf, 0, SEEK_END); size_t psize = (size_t)ftell(pf);
     fclose(pf);
@@ -578,7 +697,7 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
     fwrite(IDX_MAGIC, 1, 8, xf);
     fwrite(&cnt, 4, 1, xf);
     for (size_t i = 0; i < n; i++) {
-        fwrite(ents[i].id.b, 1, IDX_PREFIX, xf);       /* prefix only */
+        fwrite(ents[i].id.b, 1, IDX_PREFIX, xf);
         fwrite(&ents[i].off, 4, 1, xf);
     }
     size_t isize = (size_t)ftell(xf);
@@ -587,7 +706,76 @@ int pack_write(int *n_out, size_t *pack_out, size_t *idx_out) {
     if (n_out) *n_out = (int)n;
     if (pack_out) *pack_out = psize;
     if (idx_out) *idx_out = isize;
+    (void)ndelta; (void)delta_saved;
     return 0;
+}
+
+int pack_stats(int *nobj, int *ndelta_out) {
+    char packp[1300], idxp[1300];
+    pack_paths(packp, sizeof packp, idxp, sizeof idxp);
+    size_t plen; unsigned char *pk = (unsigned char *)slurp(packp, &plen);
+    if (!pk) return -1;
+    if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) { free(pk); return -1; }
+    uint32_t n; memcpy(&n, pk + 8, 4);
+    const unsigned char *pend = pk + plen;
+    size_t off = 12; int nd = 0;
+    for (uint32_t i = 0; i < n && off < plen; i++) {
+        const unsigned char *p = pk + off;
+        int bad = 0;
+        int tc = *p++;
+        if (tc == TC_DELTA) { get_varint(&p, pend, &bad); nd++; }
+        get_varint(&p, pend, &bad);
+        uint64_t zlen = get_varint(&p, pend, &bad);
+        if (bad) break;
+        off = (size_t)(p - pk) + zlen;
+    }
+    free(pk);
+    if (nobj) *nobj = (int)n;
+    if (ndelta_out) *ndelta_out = nd;
+    return 0;
+}
+
+/* Reconstruct the object at `off`, following the base chain if it is a delta.
+   `depth` guards against a corrupt file pointing a chain at itself. */
+static unsigned char *pack_at(const unsigned char *pk, size_t plen, uint32_t off,
+                              int *tc_out, size_t *len_out, int depth) {
+    if (depth > DELTA_DEPTH + 2 || off + 1 >= plen) return 0;
+    const unsigned char *pend = pk + plen, *p = pk + off;
+    int bad = 0;
+    int tc = *p++;
+
+    if (tc != TC_DELTA) {
+        uint64_t ulen = get_varint(&p, pend, &bad), zlen = get_varint(&p, pend, &bad);
+        if (bad || ulen > (uint64_t)1 << 34) return 0;
+        if ((size_t)(p - pk) + zlen > plen) return 0;
+        unsigned char *out = xmalloc(ulen + 1);
+        uLongf got = (uLongf)ulen;
+        if (uncompress(out, &got, p, (uLong)zlen) != Z_OK || got != ulen) { free(out); return 0; }
+        out[ulen] = 0;
+        if (tc_out) *tc_out = tc;
+        if (len_out) *len_out = (size_t)ulen;
+        return out;
+    }
+
+    uint64_t boff = get_varint(&p, pend, &bad), dlen = get_varint(&p, pend, &bad),
+             zlen = get_varint(&p, pend, &bad);
+    if (bad || dlen > (uint64_t)1 << 34) return 0;
+    if ((size_t)(p - pk) + zlen > plen || boff >= off) return 0;   /* bases precede */
+    unsigned char *dz = xmalloc(dlen + 1);
+    uLongf got = (uLongf)dlen;
+    if (uncompress(dz, &got, p, (uLong)zlen) != Z_OK || got != dlen) { free(dz); return 0; }
+
+    int btc; size_t blen;
+    unsigned char *base = pack_at(pk, plen, (uint32_t)boff, &btc, &blen, depth + 1);
+    if (!base) { free(dz); return 0; }
+
+    size_t olen;
+    unsigned char *out = delta_apply(base, blen, dz, (size_t)dlen, &olen);
+    free(base); free(dz);
+    if (!out) return 0;
+    if (tc_out) *tc_out = btc;                 /* a delta inherits its base's type */
+    if (len_out) *len_out = olen;
+    return out;
 }
 
 void *pack_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out) {
@@ -623,26 +811,20 @@ void *pack_read(const oid *o, char *type_out, size_t type_cap, size_t *len_out) 
     free(ix);
 
     size_t plen; unsigned char *pk = (unsigned char *)slurp(packp, &plen);
-    if (!pk) return 0;
+    if (!pk) { free(cand); return 0; }
     for (int k = 0; k < ncand; k++) {
-        uint32_t off = cand[k];
-        if (off + 1 >= plen) continue;
-        const unsigned char *p = pk + off;
-        int tc = *p++;
-        uint64_t ulen = get_varint(&p), zlen = get_varint(&p);
-        unsigned char *out = xmalloc(ulen + 1);
-        uLongf got = (uLongf)ulen;
-        if (uncompress(out, &got, p, (uLong)zlen) != Z_OK) { free(out); continue; }
-        out[ulen] = 0;
+        int tc; size_t ulen;
+        unsigned char *out = pack_at(pk, plen, cand[k], &tc, &ulen, 0);
+        if (!out) continue;
         /* the prefix was a filter; the rehash decides */
-        oid check; object_write(type_name(tc), out, (size_t)ulen, 0, &check);
+        oid check; object_write(type_name(tc), out, ulen, 0, &check);
         if (!oid_eq(&check, o)) { free(out); continue; }
-        free(pk);
+        free(pk); free(cand);
         if (type_out) snprintf(type_out, type_cap, "%s", type_name(tc));
-        if (len_out) *len_out = (size_t)ulen;
+        if (len_out) *len_out = ulen;
         return out;
     }
-    free(pk);
+    free(pk); free(cand);
     return 0;
 }
 
@@ -697,19 +879,30 @@ int pack_unpack(int *n_out) {
     if (plen < 12 || memcmp(pk, PACK_MAGIC, 8)) { free(pk); return -1; }
     uint32_t n; memcpy(&n, pk + 8, 4);
 
-    const unsigned char *p = pk + 12;
+    /* Every entry goes through the resolver, because an entry may be a delta
+       and what is stored there is then instructions, not an object. Walking the
+       header only to find the next offset keeps the scan sequential. */
+    size_t off = 12;
     int done = 0;
-    for (uint32_t i = 0; i < n && (size_t)(p - pk) < plen; i++) {
+    const unsigned char *pend = pk + plen;
+    for (uint32_t i = 0; i < n && off < plen; i++) {
+        const unsigned char *p = pk + off;
+        int bad = 0;
         int tc = *p++;
-        uint64_t ulen = get_varint(&p), zlen = get_varint(&p);
-        unsigned char *out = xmalloc(ulen + 1);
-        uLongf got = (uLongf)ulen;
-        if (uncompress(out, &got, p, (uLong)zlen) != Z_OK) { free(out); break; }
-        p += zlen;
+        if (tc == TC_DELTA) get_varint(&p, pend, &bad);
+        get_varint(&p, pend, &bad);
+        uint64_t zlen = get_varint(&p, pend, &bad);
+        if (bad) break;
+        size_t next = (size_t)(p - pk) + zlen;
+
+        int otc; size_t ulen;
+        unsigned char *out = pack_at(pk, plen, (uint32_t)off, &otc, &ulen, 0);
+        if (!out) break;
         oid o;
-        object_write(type_name(tc), out, (size_t)ulen, 1, &o);   /* writes loose */
+        object_write(type_name(otc), out, ulen, 1, &o);          /* writes loose */
         free(out);
         done++;
+        off = next;
     }
     free(pk);
     if (n_out) *n_out = done;
@@ -1204,4 +1397,182 @@ int do_fetch(const char *remote, oid *head_out, char *branch_out, size_t bcap,
     if (reach_out) *reach_out = n;
     if (sent_out) *sent_out = sent;
     return 0;
+}
+
+/* ---- delta ---- */
+
+#ifndef DELTA_BLK
+#define DELTA_BLK 16                       /* match granularity */
+#endif
+#ifndef DELTA_STEP
+/* A quarter of the block size, not the whole of it. Indexing the base every
+   16 bytes finds a match only where 16 *aligned* bytes line up, which needs a
+   run of 31 to guarantee; at a stride of 4 a run of 19 suffices. Shared code
+   sits at unaligned offsets, so a stride equal to the block was throwing away
+   most of the matches actually present: on the git-core binaries, going from
+   stride 16 to stride 4 was worth 825 KB. */
+#define DELTA_STEP (DELTA_BLK / 4)         /* base index stride */
+#endif
+
+static void dvarint(unsigned char **p, size_t v) {
+    do { unsigned char b = v & 0x7f; v >>= 7; if (v) b |= 0x80; *(*p)++ = b; } while (v);
+}
+/* Bounded. These bytes come off disk or off a socket, so a varint whose
+   continuation bit is set all the way to the end of the buffer must stop at
+   the end rather than read past it. Returns 0 and leaves *p at `end` on a
+   truncated or over-long encoding; callers treat that as a refusal. */
+static size_t dvarint_get(const unsigned char **p, const unsigned char *end, int *bad) {
+    size_t v = 0; int s = 0;
+    for (;;) {
+        if (*p >= end || s > 63) { *p = end; *bad = 1; return 0; }
+        unsigned char b = *(*p)++;
+        v |= (size_t)(b & 0x7f) << s;
+        if (!(b & 0x80)) break;
+        s += 7;
+    }
+    return v;
+}
+
+/* A rolling hash, so that advancing one byte costs a multiply and an add
+   rather than a fresh pass over the window. The scan visits every byte of the
+   target against every candidate base, so this factor is the whole cost of
+   the search: rehashing 16 bytes per position made packing 12x slower than
+   git for a 1% smaller result. */
+#define RK_MUL 16777619u
+#ifndef DELTA_CAND
+#define DELTA_CAND 64                      /* chain entries examined per position */
+#endif
+
+static unsigned rk_pow(void) {
+    unsigned p = 1;
+    for (int i = 1; i < DELTA_BLK; i++) p *= RK_MUL;
+    return p;
+}
+static unsigned blk_hash(const unsigned char *p) {
+    unsigned h = 0;
+    for (int i = 0; i < DELTA_BLK; i++) h = h * RK_MUL + p[i];
+    return h;
+}
+
+unsigned char *delta_create(const unsigned char *base, size_t blen,
+                            const unsigned char *tgt, size_t tlen, size_t *dlen) {
+    if (blen < DELTA_BLK || tlen < DELTA_BLK) return 0;
+    if (blen > 0xFFFFFFFFu) return 0;          /* copy offsets are 4 bytes */
+
+    /* Index every DELTA_STEP-aligned block of the base, chained rather than
+       open-addressed. Real objects are full of repeated blocks -- a Mach-O
+       binary is largely runs of zeros -- and with linear probing those all
+       land in one cluster, which makes both insert and lookup walk it end to
+       end. Chaining keeps insert at O(1), and the DELTA_CAND cap keeps lookup
+       from ever walking a long chain: past the first handful of candidates a
+       better match is not worth the scan. */
+    size_t nblk = (blen - DELTA_BLK) / DELTA_STEP + 1;
+    size_t nslots = 1; while (nslots < nblk * 2 + 16) nslots <<= 1;
+    size_t *head = xmalloc(nslots * sizeof *head);
+    size_t *next = xmalloc(nblk * sizeof *next);
+    for (size_t i = 0; i < nslots; i++) head[i] = (size_t)-1;
+    for (size_t k = 0; k < nblk; k++) {
+        size_t j = blk_hash(base + k * DELTA_STEP) & (nslots - 1);
+        next[k] = head[j]; head[j] = k;
+    }
+
+    unsigned char *out = xmalloc(tlen + tlen / 8 + 64), *o = out;
+    dvarint(&o, blen);
+    dvarint(&o, tlen);
+
+    const unsigned POW = rk_pow();
+    size_t pos = 0, lit = 0;
+    unsigned h = 0; int have = 0;              /* h is valid for [pos, pos+BLK) */
+
+    #define FLUSH_LIT() do { \
+        while (lit) { size_t n = lit > 127 ? 127 : lit; \
+                      *o++ = (unsigned char)n; \
+                      memcpy(o, tgt + pos - lit, n); o += n; lit -= n; } \
+    } while (0)
+
+    while (pos < tlen) {
+        size_t moff = 0, mlen = 0;
+        if (pos + DELTA_BLK <= tlen) {
+            if (!have) { h = blk_hash(tgt + pos); have = 1; }
+            size_t j = h & (nslots - 1);
+            int tries = 0;
+            for (size_t k = head[j]; k != (size_t)-1 && tries < DELTA_CAND;
+                 k = next[k], tries++) {
+                size_t b = k * DELTA_STEP;
+                if (memcmp(base + b, tgt + pos, DELTA_BLK)) continue;
+                size_t n = DELTA_BLK;                           /* extend forward */
+                while (b + n < blen && pos + n < tlen && base[b + n] == tgt[pos + n]) n++;
+                if (n > mlen) { mlen = n; moff = b; }
+                if (mlen > 4096) break;                         /* good enough */
+            }
+        }
+        if (mlen >= DELTA_BLK) {
+            FLUSH_LIT();
+            while (mlen) {
+                size_t n = mlen > 0xFFFF ? 0xFFFF : mlen;
+                unsigned char *cmd = o++;
+                unsigned char c = 0x80;
+                if (moff & 0x0000ff) { *o++ = moff        & 0xff; c |= 0x01; }
+                if (moff & 0x00ff00) { *o++ = (moff >> 8) & 0xff; c |= 0x02; }
+                if (moff & 0xff0000) { *o++ = (moff >> 16)& 0xff; c |= 0x04; }
+                if (moff & 0xff000000UL){*o++= (moff >> 24)& 0xff; c |= 0x08; }
+                if (n & 0x00ff) { *o++ = n        & 0xff; c |= 0x10; }
+                if (n & 0xff00) { *o++ = (n >> 8) & 0xff; c |= 0x20; }
+                *cmd = c;
+                moff += n; mlen -= n; pos += n;
+            }
+            have = 0;                          /* window jumped; rehash */
+        } else {
+            /* roll off tgt[pos], roll on tgt[pos+BLK] */
+            if (have && pos + DELTA_BLK < tlen)
+                h = (h - tgt[pos] * POW) * RK_MUL + tgt[pos + DELTA_BLK];
+            else
+                have = 0;
+            pos++; lit++;
+        }
+    }
+    FLUSH_LIT();
+    #undef FLUSH_LIT
+    free(head); free(next);
+    *dlen = (size_t)(o - out);
+    if (*dlen >= tlen) { free(out); return 0; }      /* no saving; store whole */
+    return out;
+}
+
+unsigned char *delta_apply(const unsigned char *base, size_t blen,
+                           const unsigned char *d, size_t dlen, size_t *olen) {
+    const unsigned char *p = d, *end = d + dlen;
+    int bad = 0;
+    size_t bsize = dvarint_get(&p, end, &bad), tsize = dvarint_get(&p, end, &bad);
+    if (bad || bsize != blen) return 0;
+    if (tsize > (size_t)1 << 34) return 0;              /* refuse an absurd claim */
+    unsigned char *out = xmalloc(tsize + 1), *o = out;
+    /* Every length is checked against both ends before it is used: the source
+       against the base, the destination against the size the header declared.
+       A delta arrives from a file that may be corrupt or hostile, and the
+       instruction stream is otherwise free to name any offset it likes. */
+    while (p < end && (size_t)(o - out) < tsize) {
+        unsigned char c = *p++;
+        if (c & 0x80) {
+            size_t off = 0, n = 0;
+            if ((c & 0x01) && p < end) off  =  *p++;
+            if ((c & 0x02) && p < end) off |= (size_t)*p++ << 8;
+            if ((c & 0x04) && p < end) off |= (size_t)*p++ << 16;
+            if ((c & 0x08) && p < end) off |= (size_t)*p++ << 24;
+            if ((c & 0x10) && p < end) n    =  *p++;
+            if ((c & 0x20) && p < end) n   |= (size_t)*p++ << 8;
+            if (!n) n = 0x10000;
+            if (off > blen || n > blen - off) { free(out); return 0; }
+            if (n > tsize - (size_t)(o - out)) { free(out); return 0; }
+            memcpy(o, base + off, n); o += n;
+        } else if (c) {
+            if ((size_t)(end - p) < c) { free(out); return 0; }
+            if ((size_t)c > tsize - (size_t)(o - out)) { free(out); return 0; }
+            memcpy(o, p, c); o += c; p += c;
+        } else { free(out); return 0; }               /* 0x00 is reserved */
+    }
+    if ((size_t)(o - out) != tsize) { free(out); return 0; }   /* short stream */
+    *o = 0;
+    if (olen) *olen = (size_t)(o - out);
+    return out;
 }

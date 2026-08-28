@@ -2,7 +2,7 @@
 
 ## Done
 
-- [x] TASK-001 Isolated parity harness. `test/parity.sh`, 10 assertions.
+- [x] TASK-001 Isolated parity harness. `test/parity.sh`, 14 assertions.
 - [x] TASK-002 Profile `add`. The `popen("find")` was 7.6 ms of 20.1 ms.
 - [x] TASK-003 Replace it with `readdir`. 20.1 → 12.2 ms, no capability lost.
 - [x] TASK-004 Byte-count analysis. See `spec/01-pack.md` and the notes below.
@@ -15,11 +15,29 @@
 - [x] TASK-005 index_upsert no longer qsorts per insert: binary search plus an
       in-place insert. add 4.1 -> 3.1 ms, checkout 15.0 -> 2.8 ms.
       re-sorting an array of 520-byte elements. Append, sort once at write.
-- [ ] TASK-009 The candidate array in `pack_read` is fixed at 8. Make it dynamic.
+- [x] TASK-009 The candidate array in `pack_read` grows rather than capping at 8.
+      A fixed array dropped candidates silently, and the dropped one could be
+      the object asked for.
 - [ ] TASK-010 mmap the pack index rather than `slurp`ing it per call. The 13.86 µs
       miss is dominated by reading a 2,448 B file, not by eight probes.
-- [ ] TASK-011 Delta encoding in the pack. The one thing git's `.pack` does that
-      ours does not.
+- [x] TASK-011 Delta encoding in the pack. Done. Same content and object count,
+      bit's pack is now 1.08x smaller than git's on source and 1.06x smaller on
+      the git-core binaries; it was 1.61x larger before. Packing costs 3.3x
+      git's time. `test/delta.sh` reproduces it.
+      Three things were learned and are worth not re-learning:
+        - the base index stride, not the window or the chain depth, is what
+          decides the result. Window 32 -> 8 and depth 50 -> 4 changed nothing;
+          stride 16 -> 4 was worth 826 KB.
+        - open addressing is quadratic here. Objects contain long runs of
+          identical blocks, and they all cluster. Chaining: 16.8 s -> 3.1 s.
+        - every benchmark fixture was /dev/urandom, where delta is worth
+          exactly zero. That is why the feature read as worthless for as long as
+          it was absent. Fixture-blindness again, after the symlink and the
+          nesting bugs.
+- [ ] TASK-013 Pack time. 4.4 s against `git gc --aggressive` at 1.4 s on the
+      32 MB corpus. The remaining cost is that each of the 32 window candidates
+      rebuilds a hash index of its own base for every target. Building it once
+      per base and keeping it with the window entry is the obvious fix.
 - [ ] TASK-012 `diff`. Then `branch`/`switch`, then `merge`.
 
 ## Notes worth keeping

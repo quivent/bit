@@ -1,11 +1,11 @@
 # bit
 
-git's data model, reimplemented in 2,486 lines of C.
+git's data model, reimplemented in 3,206 lines of C.
 
 bit writes **byte-identical objects to git**. A repository bit creates is one
 git reads: `git fsck` returns 0, `git log` reads bit's commits, and `git status`
 reads a staging area `bit add` wrote. That is the specification, not a goal, and
-`test/parity.sh` asserts it in ten places.
+`test/parity.sh` asserts it in fourteen places.
 
 26 commands, covering 20 of git's 23 common ones. Faster than git on all 26
 operations measured.
@@ -127,6 +127,53 @@ bits, and a prefix index has no false negatives, so absence is exact and free.
 Only a positive check pays a decompression — measured at 13.86 µs for a miss
 against 39.40 µs for a hit.
 
+### Delta encoding
+
+An object that resembles one already in the pack is stored as instructions to
+rebuild it from that one, rather than as its own compressed copy. The
+instruction stream is git's format: a byte with the high bit set copies a run
+from the base, one with the high bit clear inserts literal bytes.
+
+Measured on three corpora, same content and same object count on both sides:
+
+| corpus | bit, no delta | bit | | git | |
+|---|---|---|---|---|---|
+| bit's source, 3 commits | 98,007 B | **42,893 B** | 2.28× | 46,167 B | 1.08× |
+| git-core binaries, 32 MB | 15,449,819 B | **6,615,889 B** | 2.34× | 6,990,789 B | 1.06× |
+| `/dev/urandom` | 329,440 B | 329,440 B | 1.00× | 329,366 B | 1.00× |
+
+The third row is the important one. Random bytes have nothing to delta against,
+and every fixture in the benchmark suite was random bytes — which is why this
+feature was measured as worthless for as long as it was missing.
+
+Three parameters decide the result, and only one of them mattered:
+
+| | binaries |
+|---|---|
+| block 16, stride 16 | 7,442,104 B |
+| block 16, stride 8 | 6,935,572 B |
+| block 16, stride 4 | 6,615,889 B |
+| window 32 → 8 | no change |
+| chain depth 50 → 4 | no change |
+
+The stride is how often the base is indexed. At a stride equal to the block, a
+match is found only where 16 *aligned* bytes line up, which needs a run of 31 to
+guarantee; at a stride of 4 a run of 19 suffices. Shared code sits at unaligned
+offsets, so alignment was discarding most of the matches actually present. The
+window and depth caps never bound anything.
+
+The table is hashed with chaining, not open addressing. Real objects contain
+long runs of identical blocks — a Mach-O binary is largely zeros — and under
+linear probing those collapse into one cluster that both insert and lookup walk
+end to end. That was quadratic: switching to chaining took packing the 32 MB
+corpus from 16.8 s to 3.1 s, and the rolling hash added before it turned out to
+be worth almost nothing by comparison.
+
+Reconstruction is verified by the digest that named the object, so a delta that
+rebuilds the wrong bytes fails the lookup instead of returning them.
+`test/delta.sh` reproduces all of the above, including a pass that deletes every
+loose object and asserts all 45 come back byte-identical from the pack.
+
 ### Transport
 
 Content addressing answers "what do you need?" with `access()` on a path, so the
@@ -144,6 +191,7 @@ pull    11 reachable, 0 new
 | gain | cost |
 |---|---|
 | `bit pack`: 12.0 B/object index, 4.7× less disk | git cannot read the objects while packed. Reversible — `bit unpack` restores loose form, every object id verified identical |
+| delta encoding: 2.3× smaller pack on real content | packing is 3.3× slower than `git gc --aggressive`, and a read may now apply a chain of up to 50 deltas |
 | 8-byte digest prefix | a *positive* existence check pays one decompression |
 | no CRC32 | objects cannot be copied between packs without inflating |
 | no fanout table | eight probes rather than ~4 |
@@ -155,9 +203,6 @@ pull    11 reachable, 0 new
 
 - **Single platform.** macOS 15.7.5, Apple silicon. Untested elsewhere; the
   `.dylib` output is Darwin-specific.
-- **No delta encoding.** git's pack stores similar objects as reconstruction
-  instructions. bit compresses each independently — worth nothing on the random
-  blobs benchmarked, a great deal on real source.
 - **File-granularity merge.** A file changed on both sides is reported as a
   conflict, never merged line by line. `merge` and `rebase` stop rather than guess.
 - **Lightweight tags only.** An annotated tag is a fourth object type bit lacks.
@@ -189,6 +234,8 @@ hostile input, and pathological content.
 | directory nesting to 100 levels | matches git exactly |
 | symlinks, absolute, relative and dangling | all three match git, mode 120000 |
 | 4,200-commit history | `merge_base` and `log` walk it; `git fsck` 0 |
+| 200,000 fuzzed deltas, ASan + UBSan | 199,632 exact round trips; 1.6 M corrupted deltas rejected or in-bounds |
+| 400 byte-corrupted pack files, ASan + UBSan | read and unpacked with 0 memory errors |
 
 ### Defects found and fixed
 
@@ -217,6 +264,13 @@ O(n²) in ancestry depth. Both now use a growable hash set; verified against a
 `NULL` from a failed `malloc`. All allocation now routes through wrappers that
 report and exit before anything is written.
 
+**A corrupt pack could read off the end of the heap.** The delta instruction
+stream was bounds-checked, but the two length varints in its header were not: a
+varint whose continuation bit is set to the end of the buffer walked past it.
+The same hole existed at all six sites that parse a pack header. Found by the
+fuzzer on its first run, within seconds. Both varint readers now take an end
+pointer and refuse a truncated or over-long encoding, and every caller checks.
+
 **`typeof` is a GNU extension**, caught only by `-std=c11`, and would not have
 compiled under a strict toolchain.
 
@@ -229,8 +283,9 @@ were all two levels deep and symlink-free.
 
 ```sh
 ./build.sh
-./test/parity.sh      # 10 assertions against real git; non-zero on any failure
+./test/parity.sh      # 14 assertions against real git; non-zero on any failure
 ./test/vs-git.sh      # 26 paired operations, one batch, trees asserted identical
+./test/delta.sh       # delta: correctness, worth against git, parameter sensitivity
 N=2000 ./test/vs-git.sh
 ```
 
@@ -253,7 +308,7 @@ Every harness applies the same discipline, each rule learned by getting it wrong
 | `lib/bit.c` | objects, refs, index, trees, diff, pack, transport |
 | `cmd/*.c` | one file per command, each exporting `cmd_main` |
 | `spec/01-pack.md` | the pack format and the reasoning behind it |
-| `test/` | `parity.sh`, `vs-git.sh`, `bench.sh` |
+| `test/` | `parity.sh`, `vs-git.sh`, `delta.sh`, `bench.sh` |
 | `graft.pack` | declares the commands as a [graft](https://github.com/quivent/graft) namespace |
 
 ## Licence

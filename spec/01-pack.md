@@ -24,11 +24,24 @@ logical bytes barely moved. Almost the entire win was problem 1.
 .git/bitpack/bit.pack
   "BITPACK1"                    8
   u32 count                     4
-  per object, at a recorded offset:
-    u8      type                1     1 commit, 2 tree, 3 blob
-    varint  inflated length
-    varint  compressed length
-    bytes   zlib data
+  per object, at a recorded offset, one of two entry shapes:
+
+    whole object
+      u8      type              1     1 commit, 2 tree, 3 blob
+      varint  inflated length
+      varint  compressed length
+      bytes   zlib data
+
+    delta against an earlier object
+      u8      type              1     7
+      varint  base offset             absolute, always < this entry's offset
+      varint  inflated delta length
+      varint  compressed length
+      bytes   zlib delta
+
+  A delta entry has no type of its own; it inherits the type of the object at
+  the end of its base chain. Bases always precede the entries that reference
+  them, so resolution walks backwards through the file and terminates.
 
 .git/bitpack/bit.idx
   "BITIDX01"                    8
@@ -40,6 +53,66 @@ logical bytes barely moved. Almost the entire win was problem 1.
 
 Not `.git/objects/pack/`. git parses anything it finds there and reports
 `non-monotonic index`.
+
+## The delta stream
+
+Reconstruction instructions, in git's encoding. A byte with the high bit set is
+a copy from the base; its low bits say which of four offset bytes and two
+length bytes follow, so a short copy near the start of the base costs three
+bytes and a long copy far into it costs seven. A byte with the high bit clear
+is a literal insert of that many bytes, so a run of new content costs one byte
+per 127.
+
+```
+  varint  base size                   checked against the actual base
+  varint  target size                 the output buffer is sized from this
+  then, until the target size is reached:
+    1xxxxxxx  copy    [off0][off1][off2][off3][len0][len1]
+    0nnnnnnn  insert  n literal bytes, n in 1..127
+    00000000  reserved; refused
+```
+
+Both the offsets and the lengths are checked against both ends before use: the
+source against the base's actual length, the destination against the size the
+header declared. A pack is a file, and a file can be truncated, corrupted on
+disk, or written by something hostile. The first version of this checked the
+instruction stream but not the two header varints, and a varint whose
+continuation bit ran to the end of the buffer read past it — a heap overflow a
+fuzzer found within seconds of first being pointed at it.
+
+Nothing else needs to trust the delta. A reconstructed object is hashed and
+compared against the digest that named it, so a chain that rebuilds the wrong
+bytes fails the lookup rather than returning them.
+
+## Choosing a base
+
+Objects are written in (type, size-descending) order, which puts objects likely
+to resemble each other next to each other, and each is offered the last 32
+objects of its own type as a candidate base. The smallest resulting delta wins,
+and only if the whole entry — header included — comes out smaller than storing
+the object outright.
+
+Base blocks are indexed every 4 bytes at a block size of 16. Those two numbers
+are the entire result:
+
+| block | stride | git-core binaries, 32 MB |
+|---|---|---|
+| 16 | 16 | 7,442,104 B |
+| 16 | 8 | 6,935,572 B |
+| 16 | 4 | **6,615,889 B** |
+| 32 | 8 | 7,448,634 B |
+
+At a stride equal to the block, a match is found only where 16 *aligned* bytes
+line up, which needs a run of 31 bytes to guarantee; at a stride of 4, a run of
+19 suffices. Shared code sits at unaligned offsets. Meanwhile the window (32)
+and the chain depth cap (50) were measured at 8 and 4 with no change in output
+at all — neither was ever binding.
+
+The block index chains rather than probing. Real objects contain long runs of
+identical blocks — a Mach-O binary is largely zeros — and under open addressing
+those collapse into a single cluster that both insert and lookup traverse end
+to end, which is quadratic. Chaining, with a cap of 64 chain entries examined
+per position, took packing the 32 MB corpus from 16.8 s to 3.1 s.
 
 ## The index, against git's
 
