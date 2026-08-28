@@ -1,0 +1,14 @@
+graft-pack	1
+desc	bit: git data model, rebuilt as a graft namespace
+origin	graft/bit@v2
+obj	init	build/init.dylib	Create an empty repository
+obj	hash-object	build/hash-object.dylib	Hash content, optionally storing it
+obj	cat-file	build/cat-file.dylib	Show an object type, size, content, or existence
+obj	add	build/add.dylib	Stage paths into the index
+obj	status	build/status.dylib	Compare HEAD, index and working tree
+obj	write-tree	build/write-tree.dylib	Write the index out as a tree
+obj	commit	build/commit.dylib	Record staged changes
+obj	log	build/log.dylib	Walk the commit chain
+obj	checkout	build/checkout.dylib	Materialise a commit into the working tree
+obj	pack	build/pack.dylib	Collapse loose objects into one pack
+obj	unpack	build/unpack.dylib	Restore loose objects from the pack
